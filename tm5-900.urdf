@@ -1,0 +1,124 @@
+<?xml version="1.0" ?>
+<robot name="tm5-900">
+
+  <link name="base"/>
+  <joint name="base_fixed_joint" type="fixed">
+    <parent link="base"/><child link="link_0"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+  </joint>
+
+  <link name="link_0">
+    <visual><geometry><mesh filename="package://tm_description/meshes/tm5-900/visual/tm5base.obj"/></geometry></visual>
+    <collision><geometry><mesh filename="package://tm_description/meshes/tm5-900/collision/tm5base_c.stl"/></geometry></collision>
+  </link>
+
+  <joint name="joint_1" type="revolute">
+    <parent link="link_0"/><child link="link_1"/>
+    <origin rpy="0 0 0" xyz="0 0 0.1452"/><axis xyz="0 0 1"/>
+    <limit effort="157" lower="-4.712389" upper="4.712389" velocity="3.14159"/>
+  </joint>
+
+  <link name="link_1">
+    <visual><geometry><mesh filename="package://tm_description/meshes/tm5-900/visual/tmr_400w_01.obj"/></geometry></visual>
+    <collision><geometry><mesh filename="package://tm_description/meshes/tm5-900/collision/tmr_400w_01_c.stl"/></geometry></collision>
+  </link>
+
+  <joint name="joint_2" type="revolute">
+    <parent link="link_1"/><child link="link_2"/>
+    <origin rpy="-1.570796 -1.570796 0" xyz="0 0 0"/><axis xyz="0 0 1"/>
+    <limit effort="157" lower="-3.141593" upper="3.141593" velocity="3.14159"/>
+  </joint>
+
+  <link name="link_2">
+    <visual><geometry><mesh filename="package://tm_description/meshes/tm5-900/visual/tm5900_arm1.obj"/></geometry></visual>
+    <collision><geometry><mesh filename="package://tm_description/meshes/tm5-900/collision/tm5900_arm1_c.stl"/></geometry></collision>
+  </link>
+
+  <joint name="joint_3" type="revolute">
+    <parent link="link_2"/><child link="link_3"/>
+    <origin rpy="0 0 0" xyz="0.429 0 0"/><axis xyz="0 0 1"/>
+    <limit effort="157" lower="-2.70526" upper="2.70526" velocity="3.14159"/>
+  </joint>
+
+  <link name="link_3">
+    <visual><geometry><mesh filename="package://tm_description/meshes/tm5-900/visual/tm5900_arm2.obj"/></geometry></visual>
+    <collision><geometry><mesh filename="package://tm_description/meshes/tm5-900/collision/tm5900_arm2_c.stl"/></geometry></collision>
+  </link>
+
+  <joint name="joint_4" type="revolute">
+    <parent link="link_3"/><child link="link_4"/>
+    <origin rpy="0 0 1.570796" xyz="0.4115 0 -0.1223"/><axis xyz="0 0 1"/>
+    <limit effort="43" lower="-3.141593" upper="3.141593" velocity="3.92699"/>
+  </joint>
+
+  <link name="link_4">
+    <visual><geometry><mesh filename="package://tm_description/meshes/tm5-900/visual/tmr_100w_01.obj"/></geometry></visual>
+    <collision><geometry><mesh filename="package://tm_description/meshes/tm5-900/collision/tmr_100w_01_c.stl"/></geometry></collision>
+  </link>
+
+  <joint name="joint_5" type="revolute">
+    <parent link="link_4"/><child link="link_5"/>
+    <origin rpy="1.570796 0 0" xyz="0 -0.106 0"/><axis xyz="0 0 1"/>
+    <limit effort="43" lower="-3.141593" upper="3.141593" velocity="3.92699"/>
+  </joint>
+
+  <link name="link_5">
+    <visual><geometry><mesh filename="package://tm_description/meshes/tm5-900/visual/tmr_100w_02.obj"/></geometry></visual>
+    <collision><geometry><mesh filename="package://tm_description/meshes/tm5-900/collision/tmr_100w_02_c.stl"/></geometry></collision>
+  </link>
+
+  <joint name="joint_6" type="revolute">
+    <parent link="link_5"/><child link="link_6"/>
+    <origin rpy="1.570796 0 0" xyz="0 -0.11315 0"/><axis xyz="0 0 1"/>
+    <limit effort="43" lower="-4.712389" upper="4.712389" velocity="3.92699"/>
+  </joint>
+
+  <link name="link_6">
+    <visual><geometry><mesh filename="package://tm_description/meshes/tm5-900/visual/tmr_ee.obj"/></geometry></visual>
+    <collision><geometry><mesh filename="package://tm_description/meshes/tm5-900/collision/tmr_ee_c.stl"/></geometry></collision>
+  </link>
+
+  <link name="flange"/>
+  <joint name="flange_fixed_joint" type="fixed">
+    <parent link="link_6"/><child link="flange"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+  </joint>
+
+  <joint name="gripper_base_joint" type="fixed">
+    <parent link="flange"/><child link="gripper_base_link"/>
+    <origin xyz="0 0 -0.0038" rpy="0 0 0"/> 
+  </joint>
+
+  <link name="gripper_base_link">
+    <visual>
+      <geometry><mesh filename="package://toyo_chg2_s30_002/b_n_m.STL"/></geometry>
+      <material name="grey"><color rgba="0.5 0.5 0.5 1.0"/></material>
+    </visual>
+    <collision><geometry><mesh filename="package://toyo_chg2_s30_002/b_n_m.STL"/></geometry></collision>
+  </link>
+
+  <joint name="left_finger_joint" type="prismatic">
+    <parent link="gripper_base_link"/><child link="left_finger_link"/>
+    <origin xyz="0.03 0.0 0.0861" rpy="0 0 0"/> 
+    <axis xyz="-1 0 0"/>
+    <limit lower="0.0" upper="0.02" effort="100.0" velocity="0.5"/>
+  </joint>
+
+  <link name="left_finger_link">
+    <visual><geometry><mesh filename="package://toyo_chg2_s30_002/l_f_n_m.STL"/></geometry></visual>
+    <collision><geometry><mesh filename="package://toyo_chg2_s30_002/l_f_n_m.STL"/></geometry></collision>
+  </link>
+
+  <joint name="right_finger_joint" type="prismatic">
+    <parent link="gripper_base_link"/><child link="right_finger_link"/>
+    <origin xyz="-0.03 0.0 0.0861" rpy="0 0 0"/> 
+    <axis xyz="1 0 0"/>
+    <limit lower="0.0" upper="0.02" effort="100.0" velocity="0.5"/>
+  </joint>
+
+  <link name="right_finger_link">
+    <visual><geometry><mesh filename="package://toyo_chg2_s30_002/r_f_n_m.STL"/></geometry></visual>
+    <collision><geometry><mesh filename="package://toyo_chg2_s30_002/r_f_n_m.STL"/></geometry></collision>
+  </link>
+
+</robot>
