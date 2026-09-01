@@ -1,0 +1,56 @@
+cd ~/tm_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+啟動相機
+ros2 launch realsense2_camera rs_launch.py \
+  align_depth.enable:=true \
+  pointcloud.enable:=true \
+  spatial_filter.enable:=true \
+  temporal_filter.enable:=true \
+  hole_filling_filter.enable:=true \
+  clip_distance:=0.8
+  
+啟動moveit2
+ros2 launch tm5-900_moveit_config tm5-900_run_move_group.launch.py robot_ip:=192.168.10.6
+
+啟動手臂'視覺node
+python3 -m arm_node.main
+python3 -m vision_node.main
+
+
+手臂至定點  
+ros2 topic pub --once /target_pose geometry_msgs/msg/PoseStamped "{header: {frame_id: 'base'}, pose: {position: {x: 0.70, y: 0.0, z: 0.60}}}"  
+夾爪閉合
+開
+ros2 service call /set_io tm_msgs/srv/SetIO "{module: 1, type: 1, pin: 0, state: 1.0}"
+閉
+ros2 service call /set_io tm_msgs/srv/SetIO "{module: 1, type: 1, pin: 0, state: 0.0}"
+
+ 
+手眼標定（內參）
+一、開相機
+ros2 launch realsense2_camera rs_launch.py enable_color:=true
+二、開手臂
+ros2 launch tm5-900_moveit_config tm5-900_run_move_group.launch.py robot_ip:=192.168.10.6
+三、開啟校正工具
+ros2 run camera_calibration cameracalibrator \
+  --size 10x7 \
+  --square 0.025 \
+  --ros-args -r image:=/camera/camera/color/image_raw \
+             -r camera:=/camera/camera/color
+             
+ 手眼標定（外參）
+ 一、開相機
+ros2 launch realsense2_camera rs_launch.py   enable_color:=true enable_depth:=true   align_depth.enable:=true
+二、開手臂
+ros2 launch tm5-900_moveit_config tm5-900_run_move_group.launch.py robot_ip:=192.168.10.6
+三、開啟校正工具
+到python_real
+python3 checkerboard_pose_publisher1.py
+ros2 launch tm5_realsense_handeye.launch.py
+
+
+
+
+
