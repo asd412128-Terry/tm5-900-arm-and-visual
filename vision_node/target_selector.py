@@ -6,10 +6,31 @@
  交給 vision_node 決定要發布什麼訊息。
 ============================================================================
 """
+import atexit
 import math
+import os
+import select
+import shutil
 import sys
 import termios
-from .config import MAX_REACH_M, PAIR_STICKY_DISCOUNT, PAIR_STICKY_MATCH_DIST_M
+import time
+import unicodedata
+from .config import (CANDIDATE_REFRESH_INTERVAL_SEC, MAX_REACH_M, PAIR_STICKY_DISCOUNT,
+                      PAIR_STICKY_MATCH_DIST_M)
+
+
+"""中文等全形字元在終端機上佔 2 個字元寬，照 len() 算行寬會低估，導致遊標上移
+行數算少、清畫面清不乾淨——ANSI 游標控制必須照『螢幕實際列數』算，不能照字串
+元素個數算。"""
+def _display_width(s: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in s)
+
+
+"""字串在寬度 width 的終端機裡實際會佔幾個螢幕列（自動換行也算進去）。"""
+def _visual_rows(s: str, width: int) -> int:
+    if width <= 0:
+        return 1
+    return max(1, -(-_display_width(s) // width))
 
 """從 StemTracker 輸出的候選清單中，篩選可夾取目標並讓使用者手動選定。"""
 class TargetSelector:
@@ -20,11 +41,12 @@ class TargetSelector:
         self.max_reach_m = max_reach_m
 
     """把所有果梗跟番茄做「全域唯一」配對，配對跟判斷哪端是果實端(calyx)一起做：
-    果梗實際接在番茄「頂端」，不是番茄的幾何中心，所以拿果梗兩個骨架端點
-    (end0_world/end1_world) 分別去跟每顆番茄的頂端接點 (attach_world；沒有就退回
-    番茄中心 world_x/y/z) 算 3D 世界座標距離，列出「(某端點, 某顆番茄)」的所有組合、
-    由近到遠排序，依序貪婪配對——一顆番茄配走了就不能再被搶走，一根果梗也只會用
-    其中一端配走一次；配對贏的那一端，就是果實端，不用再另外比較兩端誰近。
+    拿果梗兩個骨架端點 (end0_world/end1_world) 分別去跟每顆番茄的中心 (world_x/y/z)
+    算 3D 世界座標距離，列出「(某端點, 某顆番茄)」的所有組合、由近到遠排序，依序
+    貪婪配對——一顆番茄配走了就不能再被搶走，一根果梗也只會用其中一端配走一次；
+    配對贏的那一端，就是果實端，不用再另外比較兩端誰近。
+    （原本用 bbox 頂端點配對，理論上比中心點準，但果實歪斜時頂端點不一定是實際接點，
+    改用中心點更穩定。）
     回傳 (pairs, reverse)：
       pairs   = {id(stem_dict): tomato_dict}
       reverse = {id(stem_dict): bool}，True 代表 end1 是果實端、False 代表 end0 是
@@ -47,8 +69,7 @@ class TargetSelector:
             return {}, {}
 
         def _tomato_anchor(t):
-            a = t.get('attach_world')
-            return a if a is not None else (t['world_x'], t['world_y'], t['world_z'])
+            return (t['world_x'], t['world_y'], t['world_z'])
 
         def _sticky_tomato_pos(fingerprint):
             if not prev_pairs:
@@ -135,49 +156,212 @@ class TargetSelector:
 
         return True, "", distance_to_base
 
-    """依配對番茄的深度（離相機的距離；沒配對到番茄的退回果梗自己的 z_real）排序、
-    用 check_candidate 過濾候選，列印候選清單，回傳 {idx: (target, vx, vy, vz, distance_to_base)}。"""
-    def build_valid_candidates(self, targets: list) -> dict:
+    """先用 check_candidate 把全部候選分成三堆：能夾、有配對到番茄但暫時被判定遮擋、
+    其他原因不能夾（沒配對到/超出安全範圍/向量異常）。前兩堆一起依配對番茄的深度
+    （離相機的距離；沒配對到番茄的退回果梗自己的 z_real）由近到遠重新編號（0 起算），
+    第三堆不佔用編號、只列原因參考用——遮擋是追蹤結果會隨時間變動的暫時狀態，讓它
+    跟能夾的候選一起佔編號、一起進即時面板，遮擋解除時使用者馬上看得到、選得到；
+    其他原因是結構性問題不會自己恢復，維持原本只列參考不佔編號的做法。
+    回傳 (valid, invalid_reasons, all_occluded)：
+      valid           = {新編號: (target, vx, vy, vz, distance_to_base)}
+      invalid_reasons = {新編號: 原因}，只包含「有配對到但暫時不能夾」的那些（通常是遮擋）
+      all_occluded    = True 表示這輪確實偵測到候選、但全部都因為「配對番茄被判定遮擋」
+                         被排除、沒有其他原因的候選（跟「這輪根本沒偵測到任何候選」或
+                         「候選被其他原因刷掉」要分開處理，只有全部都是遮擋時，才值得
+                         換個視角重新掃描；其他情況換視角也沒用）。"""
+    def build_valid_candidates(self, targets: list):
         def _depth_key(t):
             nt = t.get('paired_tomato')
             return nt['depth'] if nt is not None else t['z_real']
-        candidates = sorted(range(len(targets)), key=lambda i: _depth_key(targets[i]))
+        order = sorted(range(len(targets)), key=lambda i: _depth_key(targets[i]))
 
         valid = {}
-        print("\n" + "=" * 40)
-        print("這輪可選候選：")
-        for idx in candidates:
+        invalid_reasons = {}
+        rejected = []   # 除了「配對番茄被判定遮擋」以外的其他排除原因，只列原因，不佔編號
+        for idx in order:
             target = targets[idx]
 
             ok, reason, distance_to_base = self.check_candidate(target, self.max_reach_m)
-            if not ok:
-                print(f"  [ID:{idx}] {reason}，跳過。")
+            if not ok and not reason.startswith('配對番茄被判定遮擋'):
+                rejected.append(reason)
                 continue
 
             vx, vy, vz = target.get('vx', 0.0), target.get('vy', 0.0), target.get('vz', -1.0)
-            print(f"  [ID:{idx}] 深度={target['z_real']:.3f}m | X={target['world_x']:.3f}, Y={target['world_y']:.3f}, "
-                  f"Z={target['world_z']:.3f}（距基座 {distance_to_base:.3f} 公尺）"
-                  f" | Vector:[{vx:.2f}, {vy:.2f}, {vz:.2f}]")
+            vid = len(valid)
+            valid[vid] = (target, vx, vy, vz, distance_to_base)
+            if not ok:
+                invalid_reasons[vid] = reason
 
-            valid[idx] = (target, vx, vy, vz, distance_to_base)
-        print("=" * 40)
-        return valid
+        # 能夾的候選清單交給 prompt_choose_id() 的即時面板顯示（會持續更新），
+        # 這裡不重印一次，避免同一份清單在終端機出現兩次。
+        if rejected:
+            print("\n" + "=" * 40)
+            print("不能夾的（僅供參考，不佔編號）：")
+            for reason in rejected:
+                print(f"  - {reason}")
+            print("=" * 40)
+
+        pickable = any(vid not in invalid_reasons for vid in valid)
+        all_occluded = (not pickable and bool(valid) and not rejected)
+        return valid, invalid_reasons, all_occluded
     
-    """終端機互動選取目標 ID。
-    回傳選定的 idx（int），或 's'（這輪跳過）、'r'（重新偵測）。"""
-    def prompt_choose_id(self, valid: dict):
-        
-        valid_ids_str = ", ".join(str(i) for i in sorted(valid.keys()))
-        while True:
-            termios.tcflush(sys.stdin, termios.TCIFLUSH)
-            answer = input(f"要夾取哪個 ID？(可選: {valid_ids_str} / "
-                            f"s=這輪先不夾直接跳過 / r=重新偵測): ").strip().lower()
+    """把 valid 裡每個候選（编號固定）重新比對到『目前最新一幀』的座標：位置在
+    max_dist_m 內視為同一根果梗，就地更新座標/vx,vy,vz/distance_to_base；找不到
+    夠近的、或更新後 check_candidate 判定不合格，該編號標成失效（原因寫進
+    invalid_reasons），但仍留在 valid 裡佔著原本的編號——編號在整個選取過程中
+    固定不重排，避免使用者輸入的 ID 在等待期間指向別的物理目標。
+    回傳 (new_valid, invalid_reasons)。"""
+    @staticmethod
+    def refresh_valid(valid: dict, latest_targets: list, max_reach_m: float,
+                       max_dist_m: float = PAIR_STICKY_MATCH_DIST_M):
+        new_valid = {}
+        invalid_reasons = {}
+        for vid, (target, vx, vy, vz, distance_to_base) in valid.items():
+            old_pos = (target['world_x'], target['world_y'], target['world_z'])
+            match, match_d = None, max_dist_m
+            for t in latest_targets:
+                d = math.dist(old_pos, (t['world_x'], t['world_y'], t['world_z']))
+                if d < match_d:
+                    match, match_d = t, d
 
-            if answer in ('s', 'r'):
-                return answer
-
-            if not answer.isdigit() or int(answer) not in valid:
-                print(f"輸入無效，請輸入 {valid_ids_str} 其中一個，或輸入 s 跳過、r 重新偵測。")
+            if match is None:
+                new_valid[vid] = (target, vx, vy, vz, distance_to_base)
+                invalid_reasons[vid] = "目標消失或移動過大"
                 continue
 
-            return int(answer)
+            ok, reason, new_distance = TargetSelector.check_candidate(match, max_reach_m)
+            new_vx = match.get('vx', 0.0)
+            new_vy = match.get('vy', 0.0)
+            new_vz = match.get('vz', -1.0)
+            new_valid[vid] = (match, new_vx, new_vy, new_vz, new_distance)
+            if not ok:
+                invalid_reasons[vid] = reason
+        return new_valid, invalid_reasons
+
+    """把 valid 排版成即時面板要印的每一行文字（失效的候選附註原因），純格式化不列印。"""
+    @staticmethod
+    def _format_candidate_lines(valid: dict, invalid_reasons: dict) -> list:
+        lines = []
+        for vid in sorted(valid.keys()):
+            target, vx, vy, vz, distance_to_base = valid[vid]
+            reason = invalid_reasons.get(vid)
+            if reason and reason.startswith('配對番茄被判定遮擋'):
+                tag = "因遮擋無法抓取"
+            elif reason:
+                tag = f"已失效（{reason}）"
+            else:
+                tag = ""
+            lines.append(
+                f"  [ID:{vid}] 深度={target['z_real']:.3f}m | X={target['world_x']:.3f}, "
+                f"Y={target['world_y']:.3f}, Z={target['world_z']:.3f}"
+                f"（距基座 {distance_to_base:.3f} 公尺） | Vector:[{vx:.2f}, {vy:.2f}, {vz:.2f}]{tag}")
+        return lines
+
+    """終端機互動選取目標 ID，等待輸入期間原地即時更新候選座標（不往下滾動畫面）。
+    做法：把 stdin 切成 raw/cbreak 模式（關掉 ICANON/ECHO）自己逐字元讀取、自己回顯，
+    這樣才能在『使用者打字打到一半』時，安全地用 ANSI 游標控制清掉畫面重繪——如果不
+    自己接管輸入，直接對一般 input() 的畫面做游標操作，會把使用者已經打的字元從畫面上
+    抹掉（字元其實還留在 tty 的輸入緩衝區，只是畫面跟緩衝區對不上，看起來像打字消失）。
+    refresh_fn(valid) -> (new_valid, invalid_reasons)：沒有輸入的空檔，每隔
+    refresh_interval 呼叫一次，取得最新座標重繪；refresh_fn 為 None 就不即時更新。
+    invalid_reasons：呼叫端(build_valid_candidates)一開始就知道「暫時不能選」的
+    候選（通常是遮擋），例如 {vid: '配對番茄被判定遮擋(...)'}，讓面板從第一次畫面
+    就標註⚠，不用等第一次 refresh 才顯示；之後每次 refresh_fn 回傳的新版本會整個
+    取代它，遮擋解除時該 vid 就不會再出現在裡面。
+    回傳選定的 idx（int），或 's'（這輪跳過）、'r'（重新偵測）。"""
+    def prompt_choose_id(self, valid: dict, refresh_fn=None,
+                          refresh_interval: float = CANDIDATE_REFRESH_INTERVAL_SEC,
+                          invalid_reasons: dict = None):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+        invalid_reasons = dict(invalid_reasons) if invalid_reasons else {}
+        buf = ""
+        error_line = None
+        last_total_rows = 0
+        last_refresh = time.time()
+
+        def valid_ids_str():
+            return ", ".join(str(i) for i in sorted(valid.keys()) if i not in invalid_reasons)
+
+        def redraw():
+            nonlocal last_total_rows
+            width = shutil.get_terminal_size((80, 24)).columns
+            block = self._format_candidate_lines(valid, invalid_reasons)
+            if error_line:
+                block.append(error_line)
+            block.append(f"要夾取哪個 ID？(可選: {valid_ids_str()} / "
+                          f"s=這輪先不夾直接跳過 / r=重新偵測): {buf}")
+            total_rows = sum(_visual_rows(ln, width) for ln in block)
+
+            out = []
+            if last_total_rows:
+                up = last_total_rows - 1
+                if up > 0:
+                    out.append(f"\033[{up}A")
+                out.append("\r\033[J")
+            out.append("\r\n".join(block))
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+            last_total_rows = total_rows
+
+        def restore_tty():
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        try:
+            new_settings = termios.tcgetattr(fd)
+            new_settings[3] = new_settings[3] & ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(fd, termios.TCSANOW, new_settings)
+            # 這段可能跑在 daemon 執行緒裡：process 被 Ctrl+C 中斷結束時，這條
+            # 執行緒會被直接放棄、下面的 finally 不會執行——註冊 atexit 當保險，
+            # 確保 process 結束前終端機一定會被切回正常模式，不會卡在沒回顯的狀態。
+            atexit.register(restore_tty)
+
+            redraw()
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if not ready:
+                    now = time.time()
+                    if refresh_fn and now - last_refresh >= refresh_interval:
+                        new_valid, new_invalid_reasons = refresh_fn(valid)
+                        valid.clear()
+                        valid.update(new_valid)
+                        invalid_reasons.clear()
+                        invalid_reasons.update(new_invalid_reasons)
+                        last_refresh = now
+                        redraw()
+                    continue
+
+                ch = os.read(fd, 1).decode(errors='ignore')
+
+                if ch in ('\r', '\n'):
+                    answer = buf.strip().lower()
+                    buf = ""
+                    error_line = None
+
+                    if answer in ('s', 'r'):
+                        return answer
+
+                    if answer.isdigit() and int(answer) in valid:
+                        vid = int(answer)
+                        reason = invalid_reasons.get(vid)
+                        if reason:
+                            error_line = f"[ID:{vid}] 已失效（{reason}），請重新選擇。"
+                            redraw()
+                            continue
+                        return vid
+
+                    error_line = f"輸入無效，請輸入 {valid_ids_str()} 其中一個，或輸入 s 跳過、r 重新偵測。"
+                    redraw()
+                elif ch in ('\x7f', '\x08'):
+                    buf = buf[:-1]
+                    redraw()
+                elif ch.isprintable():
+                    buf += ch
+                    redraw()
+        finally:
+            atexit.unregister(restore_tty)
+            restore_tty()
+            sys.stdout.write("\r\n")
+            sys.stdout.flush()

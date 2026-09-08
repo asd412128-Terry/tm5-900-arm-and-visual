@@ -25,16 +25,22 @@ class StemTracker:
         self.max_miss = max_miss
         self.tracks = []   # 每個 track: {'history': deque(整包 det dict), '_miss': int}
 
-    """視窗內取信心分數最高的一幀，整包原封不動輸出（不逐欄位混合平均）。
-    ★ 不能對 cx/cy/world_x/y/z 逐欄位加權平均：果梗骨架通常是彎的，視窗內幾幀如果
-    因為 mask 邊緣雜訊、深度取樣抖動讓抓取點沿骨架路徑跳到不同位置，對彎曲路徑上的
-    座標做加權平均，算出來的點會落在骨架外面、不是任何一幀真正量到的位置——嚴重的話
-    可以偏到接近另一端，即使每一幀單獨看方向判斷(calyx/branch)都是對的。整幀二選一
-    保證輸出一定是某一幀真實量到、自洽的結果。"""
+    """視窗內取信心分數最高的一幀當底，其餘欄位（bbox/mask/conf/方向向量/像素端點……）
+    原封不動沿用那一幀；只有 world_x/y/z（抓取點座標）改成視窗內的算術平均，跟
+    TomatoTracker 的座標平滑做法統一。
+    ★ 這裡跟番茄中心平均不完全一樣：果梗骨架通常是彎的，如果視窗內幾幀的抓取點量到
+    骨架上不同位置（不是同一點附近的雜訊，而是沿路徑跳動），平均出來的座標理論上可能
+    落在骨架外面（彎曲路徑上兩點的直線中點不一定還在路徑上）。2026-09-04 先接受這個
+    風險換取跟番茄一致、去雜訊的座標；如果實測發現抓取點偏移、夾歪，優先回頭懷疑這裡。"""
     @classmethod
     def _smoothed_record(cls, history: deque) -> dict:
         best = max(history, key=lambda d: d.get('conf', 0.0))
-        return dict(best)
+        rec = dict(best)
+        n = len(history)
+        rec['world_x'] = sum(d['world_x'] for d in history) / n
+        rec['world_y'] = sum(d['world_y'] for d in history) / n
+        rec['world_z'] = sum(d['world_z'] for d in history) / n
+        return rec
 
     """用像素距離把本幀偵測跟既有 track 配對、更新滑動視窗，回傳每個 track 目前的代表偵測
     （視窗內信心最高的一幀）；清除連續配對失敗超過 max_miss 的 track。"""

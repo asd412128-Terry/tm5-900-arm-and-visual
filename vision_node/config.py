@@ -101,10 +101,10 @@ MIN_VALID_DEPTH_M = 0.01             # 深度小於這個值視為無效
 
 # --- 番茄遮擋判斷 (搬自 test_occlusion.py，門檻沿用同一組) -------------------------
 #ASPECT_RATIO_LOW = 0.9               # isaac_bbox 長寬比下限
-#ASPECT_RATIO_HIGH = 1.5              # isaac_bbox 長寬比上限
+ASPECT_RATIO_HIGH = 1.5              # isaac_bbox 長寬比上限
 ASPECT_RATIO_LOW = 0.9                # real_bbox 長寬比下限
-ASPECT_RATIO_HIGH = 1.3               # real_bbox 長寬比上限
-SOLIDITY_THRESH = 0.85                # mask 面積 / 擬合橢圓面積，低於這個判定形狀跟橢圓差太多
+#ASPECT_RATIO_HIGH = 1.3               # real_bbox 長寬比上限
+SOLIDITY_THRESH = 0.9               # mask 面積 / 擬合橢圓面積，低於這個判定形狀跟橢圓差太多
 
 # --- 果梗骨架化 / 抓取點 -----------------------------------------------------
 # 'ratio'：固定沿骨架路徑走 (GRASP_RATIO_MIN+GRASP_RATIO_MAX)/2 比例(從calyx算起)，
@@ -112,7 +112,7 @@ SOLIDITY_THRESH = 0.85                # mask 面積 / 擬合橢圓面積，低�
 #          2cm 以內)的情境，用固定物理距離很容易逼近甚至超過整根果梗長度。
 # 'distance'：固定物理距離 GRASP_TARGET_DIST_M，太短量不到才退回比例保底；適合果梗
 #          長度差異大、且長果梗夠長時的情境。目前實測這批果梗普遍偏短，先用 'ratio'。
-GRASP_METHOD = 'distance'
+GRASP_METHOD = 'ratio'
 GRASP_RATIO_MIN = 0.4
 GRASP_RATIO_MAX = 0.5
 GRASP_TARGET_DIST_M = 0.015           # 只有 GRASP_METHOD='distance' 時才用，抓取點目標離calyx的實際距離(m)
@@ -135,11 +135,15 @@ PAIR_STICKY_DISCOUNT = 0.7           # 前一幀配對過的番茄，距離打�
 TOMATO_MATCH_DIST_M = 0.03           # 番茄前後幀配對容忍距離(公尺)，用於穩定遮擋判斷
 TOMATO_OCC_CONFIRM_FRAMES = 3        # 遮擋判定要連續幾幀改變才真的切換，單幀雜訊不算數
 TOMATO_TRACK_MAX_MISS = 5            # 番茄追蹤連續幾幀沒配對到就視為消失，清掉暫存狀態
+TOMATO_POS_SMOOTH_WINDOW = 7         # 番茄中心座標跨幀平均的視窗長度(幀數)，跟 STEM_TRACK_WINDOW 同量級，做法統一
 
 # --- 掃描 / 選取流程 -------------------------------------------------------
 EMPTY_SCAN_GRACE = 2                 # 連續幾次空掃描才回報 NO_TARGET
+OCCLUDED_SCAN_GRACE = 3              # 連續幾輪候選都判定「全部遮擋」才真的回報 OCCLUDED、
+                                      # 換視角；剛到新視角時追蹤視窗還沒填滿，避免只看一輪就誤判
 SCAN_PRINT_INTERVAL = 1.5            # 終端機列印候選清單的節流間隔 (s)
 MAX_REACH_M = 1.5                    # 距離基座超過此值的候選直接排除
+CANDIDATE_REFRESH_INTERVAL_SEC = 1.0 # 等待使用者輸入 ID 期間，即時面板重繪的節流間隔 (s)
 
 # --- 點雲閘門 / 目標過濾 -----------------------------------------------
 # ★ 原本這個 gate + 轉發是寫在手臂端 (arm_car_vector_z.py) 的 TM5MTaskNode，

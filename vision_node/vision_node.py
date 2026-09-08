@@ -34,8 +34,8 @@ from .config import (ARM_FLANGE_FRAME, CAMERA_EXTRINSIC_ROTATION_QUAT,
                       CAMERA_EXTRINSIC_TRANSLATION, CAMERA_INFO_TOPIC, CAMERA_OPTICAL_FRAME,
                       COLOR_TOPIC, DEPTH_TOPIC, DISPLAY_SCALE, EMPTY_SCAN_GRACE,
                       ENABLE_MANUAL_INTRINSIC_CALIB, MIN_STEM_DEPTH_PX, MODEL_PATH,
-                      OCTOMAP_UPDATE_WAIT_SEC, SCAN_PRINT_INTERVAL, VISION_MODE,
-                      WORLD_FRAME, YOLO_CONF, YOLO_IMGSZ, YOLO_IOU)
+                      OCCLUDED_SCAN_GRACE, OCTOMAP_UPDATE_WAIT_SEC, SCAN_PRINT_INTERVAL,
+                      VISION_MODE, WORLD_FRAME, YOLO_CONF, YOLO_IMGSZ, YOLO_IOU)
 from .coordinates import CoordinateEstimator
 from .detector import ObjectDetector
 from .mask_publisher import TargetMaskBuilder
@@ -102,6 +102,8 @@ class VisionNode(Node):
         self._empty_scan_count = 0
         self._empty_scan_grace = EMPTY_SCAN_GRACE
         self._no_target_sent = False
+        self._occluded_scan_count = 0
+        self._occluded_scan_grace = OCCLUDED_SCAN_GRACE
         self.latest_targets = []
         self.latest_tomatoes = []
 
@@ -123,6 +125,7 @@ class VisionNode(Node):
             if not self.task_completed:
                 self._empty_scan_count = 0
                 self._no_target_sent = False
+                self._occluded_scan_count = 0
             self.task_completed = True
         else:
             self.task_completed = False
@@ -176,7 +179,7 @@ class VisionNode(Node):
     """一次性動作：算出目標果梗 + 番茄的合併膨脹遮罩，發布成一張 Image，
     交給獨立的 cloud_filter_node.py 去做實際的點雲過濾與發布給 OctoMap。"""
     def _publish_target_filter_mask(self, stem_obj: dict):
-        combined, stem_px, tomato_px = self.mask_builder.build_combined_mask(stem_obj, self.latest_tomatoes)
+        combined, stem_px, tomato_px = self.mask_builder.build_combined_mask(stem_obj)
         if combined is None:
             self.get_logger().warn('目標果梗沒有 mask 資料，跳過本次遮罩發布。')
             return
@@ -273,7 +276,11 @@ class VisionNode(Node):
         if len(detected_objects) > 0:
             self._empty_scan_count = 0
             self.is_processing = True
-            threading.Thread(target=self.auto_pick_thread).start()
+            # daemon=True：夾取流程可能卡在 prompt_choose_id() 等終端輸入，
+            # Ctrl+C 產生的 KeyboardInterrupt 只會送到主執行緒；這條非 daemon
+            # 的話，主執行緒中斷後整個 process 還是會被這條卡住的執行緒拖著
+            # 不讓退出，要按第二次 Ctrl+C 或砍掉終端才會真的結束。
+            threading.Thread(target=self.auto_pick_thread, daemon=True).start()
         else:
             self._empty_scan_count += 1
             print(f"這幀沒有偵測到番茄(連續 {self._empty_scan_count}/{self._empty_scan_grace})...")
@@ -296,15 +303,34 @@ class VisionNode(Node):
             self.is_processing = False
             return
 
-        valid = self.target_selector.build_valid_candidates(targets)
-        if not valid:
-            print("這輪沒有可夾取的目標，通知手臂回初始位置。")
-            self.no_target_pub.publish(String(data='NO_TARGET'))
-            self.task_completed = False
+        valid, invalid_reasons, all_occluded = self.target_selector.build_valid_candidates(targets)
+        pickable = any(vid not in invalid_reasons for vid in valid)
+        if not pickable:
+            if all_occluded:
+                self._occluded_scan_count += 1
+                print(f"這輪候選全部被判定遮擋（連續 {self._occluded_scan_count}/"
+                      f"{self._occluded_scan_grace}）...")
+                if self._occluded_scan_count >= self._occluded_scan_grace:
+                    print("已連續多輪確認全部遮擋，通知手臂換個視角重新掃描。")
+                    self.no_target_pub.publish(String(data='OCCLUDED'))
+                    self._occluded_scan_count = 0
+                    self.task_completed = False
+                # 還沒連續確認夠次數：先不通知手臂，維持 task_completed，讓偵測繼續跑，
+                # 累積更多幀再判斷——避免剛到新視角、追蹤視窗還沒填滿就被誤判成全遮擋。
+            else:
+                self._occluded_scan_count = 0
+                print("這輪沒有可夾取的目標，通知手臂回初始位置。")
+                self.no_target_pub.publish(String(data='NO_TARGET'))
+                self.task_completed = False
             self.is_processing = False
             return
 
-        answer = self.target_selector.prompt_choose_id(valid)
+        self._occluded_scan_count = 0
+        answer = self.target_selector.prompt_choose_id(
+            valid,
+            refresh_fn=lambda v: self.target_selector.refresh_valid(
+                v, self.latest_targets, self.target_selector.max_reach_m),
+            invalid_reasons=invalid_reasons)
 
         if answer == 's':
             print("略過這輪，不夾取，通知手臂回初始位置。")

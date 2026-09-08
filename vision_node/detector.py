@@ -175,27 +175,16 @@ class ObjectDetector:
         if not all(math.isfinite(v) for v in (wp.point.x, wp.point.y, wp.point.z)):
             return
 
-        # 果梗實際接在番茄「頂端」，不是幾何中心——配對用頂端接點距離比用中心準。
-        # 深度不用這個像素本身量到的原始深度：bbox 頂端邊緣本來就是 mask 最容易缺角/
-        # 雜訊最多的地方，直接在那裡取深度容易失敗或量到背景。改沿用跟中心點同一組
-        # 半徑校正算出來的 z_center_t——頂端跟中心本來就是同一顆球面上的點，深度用
-        # 同一個值只差在 x/y 的投影角度，比重新在雜訊邊緣量測穩。量不到才整顆退回中心。
-        attach_world = None
-        top_x, top_y = cx_t, int(b[1])
-        lp_top = self.coord.backproject_to_local_point(top_x, top_y, z_center_t, fx, fy, ux_img, uy_img, stamp=stamp)
-        wp_top = tf2_geometry_msgs.do_transform_point(lp_top, trans)
-        if all(math.isfinite(v) for v in (wp_top.point.x, wp_top.point.y, wp_top.point.z)):
-            attach_world = (wp_top.point.x, wp_top.point.y, wp_top.point.z)
-
         detected_tomatoes.append({
             'cx': cx_t, 'cy': cy_t,
             'bbox': b,
             'world_x': wp.point.x, 'world_y': wp.point.y, 'world_z': wp.point.z,
-            'attach_world': attach_world,   # bbox 頂端中點的世界座標，供果梗配對用；失敗時為 None(配對退回中心)
             'depth': z_t,   # 表面深度 (相機讀到的原始深度，公尺，尚未加上番茄半徑)
             'mask': mask_bin_t,
             'occluded': occluded,
             'occlusion_reason': occlusion_reason,
+            'aspect_ratio': metrics['aspect_ratio'] if metrics is not None else None,
+            'solidity': metrics['solidity'] if metrics is not None else None,
         })
         # 番茄框框顏色（要不要標紅/綠）要看它有沒有配對到果梗，這件事只有拿到本幀
         # 全部果梗清單後才能判斷，所以畫框改到 visualizer.draw_tracked_overlay 那邊做。

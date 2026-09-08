@@ -9,8 +9,6 @@
 ============================================================================
 """
 
-import math
-
 import cv2
 import numpy as np
 
@@ -26,22 +24,20 @@ class TargetMaskBuilder:
         self.stem_dilate_px = stem_dilate_px
         self.tomato_dilate_px = tomato_dilate_px
 
-    """用果梗中心點找最近的番茄，回傳它的 mask (可能是 None，代表這顆番茄沒有 mask 資料)。"""
-    @staticmethod
-    def find_matching_tomato_mask(stem_obj: dict, tomatoes: list):
-        if not tomatoes:
-            return None
-        dists = [math.hypot(stem_obj['cx'] - t['cx'], stem_obj['cy'] - t['cy']) for t in tomatoes]
-        nearest = tomatoes[int(np.argmin(dists))]
-        return nearest.get('mask')
-
-    """回傳 (combined_mask, stem_px_count, tomato_px_count) 或 (None, 0, 0)（果梗沒有 mask 資料時）。"""
-    def build_combined_mask(self, stem_obj: dict, tomatoes: list):
+    """回傳 (combined_mask, stem_px_count, tomato_px_count) 或 (None, 0, 0)（果梗沒有 mask 資料時）。
+    番茄 mask 直接讀 stem_obj['paired_tomato']（detector.py 配對時算好、每幀跟著
+    TargetSelector.resolve_live_pairing 校正過的結果），不能像以前那樣另外拿果梗
+    中心點對 tomatoes 重新找最近的番茄——那個做法沒有距離門檻、也不看 3D 深度，
+    同一串裡兩顆番茄 2D 位置擠在一起時，使用者按下 Enter 那一刻最新一幀誰的像素
+    距離剛好比較近就會被錯挖，跟配對演算法算出來、使用者實際選定的那顆對不上。
+    挖錯洞會讓真正要夾的番茄留在點雲裡當障礙物，夾取失敗或路徑規劃被擋。"""
+    def build_combined_mask(self, stem_obj: dict):
         stem_mask = stem_obj.get('mask')
         if stem_mask is None:
             return None, 0, 0
 
-        tomato_mask = self.find_matching_tomato_mask(stem_obj, tomatoes)
+        paired_tomato = stem_obj.get('paired_tomato')
+        tomato_mask = paired_tomato.get('mask') if paired_tomato is not None else None
 
         stem_kernel = np.ones((self.stem_dilate_px, self.stem_dilate_px), np.uint8)
         dilated_stem = cv2.dilate(stem_mask, stem_kernel, iterations=1)

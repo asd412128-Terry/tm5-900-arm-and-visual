@@ -7,7 +7,7 @@
 """
 
 import cv2
-from .config import MAX_REACH_M
+from .config import ASPECT_RATIO_HIGH, ASPECT_RATIO_LOW, MAX_REACH_M, SOLIDITY_THRESH
 from .target_selector import TargetSelector
 
 """在畫面上疊加偵測框/資訊面板，並在終端機列印掃描結果。"""
@@ -21,6 +21,8 @@ class Visualizer:
         font = cv2.FONT_HERSHEY_SIMPLEX
 
         for idx, obj in enumerate(detected_objects):
+            if obj.get('paired_tomato') is None:
+                continue  # 沒配對到番茄的果梗不畫，避免讓人誤以為可以選
             b = obj['bbox']
             ok, _, _ = TargetSelector.check_candidate(obj, MAX_REACH_M)
             color = GREEN if ok else RED
@@ -41,28 +43,49 @@ class Visualizer:
                 tomato_label_num[id(nt)] = stem_idx
 
         for idx, t in enumerate(detected_tomatoes):
-            pickable = (id(t) in tomato_label_num) and not t.get('occluded', False)
+            if id(t) not in tomato_label_num:
+                continue  # 沒配對到果梗的番茄不畫，避免讓人誤以為可以選
+            pickable = not t.get('occluded', False)
             color = GREEN if pickable else RED
             tb = t['bbox']
-            label_num = tomato_label_num.get(id(t), idx)
+            label_num = tomato_label_num[id(t)]
             cv2.rectangle(cv_image, (int(tb[0]), int(tb[1])), (int(tb[2]), int(tb[3])), color, 2)
             cv2.circle(cv_image, (t['cx'], t['cy']), 5, color, -1)
             cv2.putText(cv_image, f"T{label_num}", (int(tb[0]), int(tb[1]) - 6), font, 0.6, color, 2, cv2.LINE_AA)
 
         self.draw_info_panel(cv_image, detected_objects, detected_tomatoes)
 
-    """在畫面左上角疊加半透明面板，列出每個果梗與配對番茄的世界座標（精簡版面）。"""
+    """分別判斷 aspect_ratio、solidity 是否超出 occlusion.py 判定遮擋的門檻（跟
+    OcclusionChecker.judge_occlusion 同一組門檻，維持顯示跟實際判斷一致），各自
+    獨立回傳，不合併成一個結果——面板才能讓兩個指標各自顯示自己的紅/綠，不會
+    因為其中一個沒過就把兩個都標成紅色。超過門檻(異常)回傳 True。"""
+    @staticmethod
+    def _aspect_ratio_bad(aspect_ratio):
+        return aspect_ratio < ASPECT_RATIO_LOW or aspect_ratio > ASPECT_RATIO_HIGH
+
+    @staticmethod
+    def _solidity_bad(solidity):
+        return solidity < SOLIDITY_THRESH
+
+    """在畫面左上角疊加半透明面板，列出每個果梗與配對番茄的世界座標、番茄的形狀指標
+    （精簡版面）。每行可以有自己的顏色（YELLOW=標題，WHITE=座標，RED/GREEN=形狀指標
+    是否超過 occlusion 判定門檻），用 (text, color) tuple 取代原本整行統一上色。"""
     def draw_info_panel(self, img, stems, tomatoes):
-        lines = [f"{len(stems)} stems / {len(tomatoes)} tomatoes"]
+        WHITE, YELLOW, RED, GREEN = (255, 255, 255), (0, 255, 255), (0, 0, 255), (0, 255, 0)
+        lines = [(f"{len(stems)} stems / {len(tomatoes)} tomatoes", YELLOW)]
         for idx, obj in enumerate(stems):
-            lines.append(f"[{idx}]S X={obj['world_x']:.3f} Y={obj['world_y']:.3f} Z={obj['world_z']:.3f} D={obj['z_real']:.3f}")
+            lines.append((f"[{idx}]S X={obj['world_x']:.3f} Y={obj['world_y']:.3f} Z={obj['world_z']:.3f} D={obj['z_real']:.3f}", WHITE))
             nt = obj.get('paired_tomato')
             if nt is not None:
-                lines.append(f"   T X={nt['world_x']:.3f} Y={nt['world_y']:.3f} Z={nt['world_z']:.3f} D={nt.get('depth', 0.0):.3f}")
+                lines.append((f"   T X={nt['world_x']:.3f} Y={nt['world_y']:.3f} Z={nt['world_z']:.3f} D={nt.get('depth', 0.0):.3f}", WHITE))
+                ar, sol = nt.get('aspect_ratio'), nt.get('solidity')
+                if ar is not None and sol is not None:
+                    lines.append((f"   AR={ar:.2f}", RED if self._aspect_ratio_bad(ar) else GREEN))
+                    lines.append((f"   Mask/All={sol:.2f}", RED if self._solidity_bad(sol) else GREEN))
 
         font, scale, thick, line_h, pad = cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1, 14, 6
         x0, y0 = 10, 10
-        max_w = max((cv2.getTextSize(ln, font, scale, thick)[0][0] for ln in lines), default=0)
+        max_w = max((cv2.getTextSize(ln, font, scale, thick)[0][0] for ln, _ in lines), default=0)
         panel_w, panel_h = max_w + pad * 2, line_h * len(lines) + pad * 2
 
         overlay = img.copy()
@@ -70,8 +93,7 @@ class Visualizer:
         cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
 
         y = y0 + pad + 9
-        for i, ln in enumerate(lines):
-            color = (0, 255, 255) if i == 0 else (255, 255, 255)
+        for ln, color in lines:
             cv2.putText(img, ln, (x0 + pad, y), font, scale, color, thick, cv2.LINE_AA)
             y += line_h
 
