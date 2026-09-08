@@ -19,7 +19,7 @@ ARM_MODE = os.environ.get('ARM_MODE', 'real').strip().lower()
 if ARM_MODE not in ('real', 'isaac'):
     ARM_MODE = 'isaac'
 
-MODE = 'lab'   # 'car' 或 'lab' ← 只改這一行切換環境
+MODE = 'car'   # 'car' 或 'lab' ← 只改這一行切換環境
 
 
 # ===========================================================================
@@ -32,6 +32,11 @@ if MODE == 'car':
     #POSE_HOME_DEG = [-90.0, -15.0, 65.0, -50.0, 90.0, 0.0]
     POSE_HOME_DEG =[-90.0, -7.0, 125.0, -118.0, 90.0, 0.0]
     POSE_FINE_DEG = [-90.0, -7.0, 125.0, -118.0, 90.0, 0.0]
+
+    # 假粗定位番茄座標（車用相機還沒接上，先頂著測 -30cm 管線；見下方共用參數區塊
+    # COARSE_TO_FINE_RETREAT_M 的說明）。2026-09-03 用 /compute_fk 對 POSE_FINE_DEG
+    # 實測、往前推 30cm 算出來。
+    FAKE_COARSE_TOMATO_POSE = (-0.1223, -0.7242, 0.4838, 0.707107, 0.0, 0.0, 0.707107, math.radians(-90.0))
 
     VG_FINGER_EXT_SIZE = [0.005, 0.005, 0.01]
 
@@ -49,6 +54,11 @@ elif MODE == 'lab':
     #POSE_HOME_DEG = [0.0, -15.0, 65.0, -50.0, 90.0, 0.0]
     POSE_HOME_DEG = [0.0, 0.0, 135.0, -135.0, 90.0, 0.0]
     POSE_FINE_DEG = [0.0, 0.0, 135.0, -135.0, 90.0, 0.0]
+
+    # 假粗定位番茄座標（車用相機還沒接上，先頂著測 -30cm 管線；見下方共用參數區塊
+    # COARSE_TO_FINE_RETREAT_M 的說明）。2026-09-03 用 /compute_fk 對 POSE_FINE_DEG
+    # 實測、往前推 30cm 算出來。
+    FAKE_COARSE_TOMATO_POSE = (0.7041, -0.1223, 0.3892, 0.5, 0.5, 0.5, 0.5, math.radians(0.0))
 
     VG_FINGER_EXT_SIZE = [0.005, 0.005, 0.015]
 
@@ -69,7 +79,7 @@ PLANNER_ID   = 'RRTstarkConfigDefault'
 ARM_JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 
 # --- 夾爪幾何與開合量 -------------------------------------------------------
-GRIPPER_LENGTH  = 0.175      # isaac_法蘭面到夾爪咬合中心的距離 (m)
+GRIPPER_LENGTH  = 0.16      # isaac_法蘭面到夾爪咬合中心的距離 (m)
 #GRIPPER_LENGTH  = 0.17      # real_法蘭面到夾爪咬合中心的距離 (m)
 APPROACH_DIST   = 0.10      # 預備點 A 沿接近軸再往後退多少 (m)
 
@@ -103,6 +113,34 @@ CAR_TOUCH_LINKS  = ['base', 'link_1']
 # --- 預設關節姿態 (單位：度)（POSE_HOME_DEG / POSE_FINE_DEG 依 MODE 決定）----
 POSE_BASKET_DEG = [-42.0, 29.0, 31.0, -15.0, 90.0, 0.0]
 
+# --- 精定位目標（座標+姿態版）------------------------------------------------
+# _move_to_fine 現在走 go_to_pose（座標+姿態，OMPL 解 IK），不是 go_to_joints。
+# 流程：粗定位（車用相機）算出番茄座標+姿態 → arm_task_node.py 用
+# MathUtils.retreat_along_local_z 沿那個姿態的局部 Z 軸退 COARSE_TO_FINE_RETREAT_M
+# 公尺，退到的位置才是精定位實際要到的點，交給 go_to_pose。這段 -30cm 運算是每次
+# 精定位都會真的執行的程式碼，不是預先算好寫死結果。
+#
+# 車用相機還沒接上，先用假座標頂著測整條管線：FAKE_COARSE_TOMATO_POSE（依 MODE 分
+# 別定義在上面 car/lab 區塊，2026-09-03 用 /compute_fk 對各自的 POSE_FINE_DEG 實測、
+# 往前推 30cm 算出來）假裝是「粗定位算出來的番茄座標」——這樣 arm_task_node.py 跑
+# retreat_along_local_z 退 30cm 之後，會退回原本 POSE_FINE_DEG 那個已知正確的位置，
+# 用來驗證整條 -30cm 管線算得對不對。之後接上真的車用相機，把各 MODE 的
+# FAKE_COARSE_TOMATO_POSE 換成相機即時算出來的番茄座標+姿態就好，arm_task_node.py
+# 不用再改。
+# 格式：(x, y, z, qx, qy, qz, qw, yaw)，yaw 對應 joint_1 目標角度 (rad)。
+COARSE_TO_FINE_RETREAT_M = 0.30
+
+# --- 遮擋備用視角 --------------------------------------------------------------
+# 這輪候選番茄「全部」被判定遮擋時（vision_node 發 OCCLUDED），依序換到這些視角
+# 重新掃描，都試過還是不行才真的回 Home。
+# 2026-09-04：改成跟主流程共用同一個目標點 FAKE_COARSE_TOMATO_POSE，在半徑
+# COARSE_TO_FINE_RETREAT_M 的球面上，把姿態繞世界 Z 軸(垂直軸)偏移這些角度——
+# 距離跟「有沒有面對目標」都保證不變，只換方位角，實際算法見
+# MathUtils.orbit_around_target。跟舊版「只轉 joint_1、其他關節不變」的差別是：
+# 舊版繞的是基座轉軸，準心不保證還對著同一顆番茄；這版繞的是目標點本身，準心
+# 保證還對著同一個點。
+ALT_VIEW_AZIMUTH_OFFSETS_DEG = [30.0, -30.0]
+
 # 點雲轉發 / 過濾已搬到視覺端 (vision_node)，本模組不再直接碰點雲。
 
 # --- 速度 / 規劃參數 ---------------------------------------------------------
@@ -110,7 +148,7 @@ JOINT_VEL, JOINT_ACC = 0.2, 0.2    # 關節空間移動
 POSE_VEL,  POSE_ACC  = 0.2, 0.2    # OMPL 位姿移動
 CART_VEL,  CART_ACC  = 0.15, 0.15    # 笛卡爾直線
 
-PLAN_TIME_JOINT = 1.5
+PLAN_TIME_JOINT = 3.0
 PLAN_TIME_POSE  = 5.0
 PLAN_ATTEMPTS   = 15
 
@@ -130,8 +168,9 @@ ELBOW_UP_TOLERANCE = math.radians(90.0)
 
 # --- 任務流程 ----------------------------------------------------------------
 GO_TO_BASKET        = False   # True = 夾完先去籃子放；False = 直接回 Home
+RETURN_HOME_MAX_RETRIES = 3   # 任何一步失敗後，退回初始姿態最多重試幾次才放棄、轉 IDLE 請人工檢查
 PAUSE_AT_APPROACH   = 1.0     # 抵達點 A 後停頓 (s)
-PAUSE_AFTER_GRASP   = 1.0     # 夾緊後停頓
+PAUSE_AFTER_GRASP   = 1.5     # 夾緊後停頓
 PAUSE_AFTER_RELEASE = 1.0     # 放開後停頓
 PAUSE_BEFORE_IDLE   = 1.0     # 回 Home 後等手臂穩定
 PAUSE_BEFORE_SCAN   = 1.0     # 抵達精定位後、開始偵測前停頓

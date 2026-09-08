@@ -80,3 +80,41 @@ class MathUtils:
         grasp_target    = (grasp[0], grasp[1], grasp[2], qx, qy, qz, qw, base_yaw)
         approach_target = (app[0],   app[1],   app[2],   qx, qy, qz, qw, base_yaw)
         return grasp_target, approach_target
+
+    """給某個座標+姿態，沿這個姿態的局部 Z 軸往回退 distance 公尺，回傳新的 (x,y,z)，
+    姿態 (qx,qy,qz,qw) 不變。用在「已經知道要看向哪個點、哪個姿態，但要退到安全/適合
+    拍攝的距離外」的情境——例如番茄座標配上一個朝向後，退到不會撞上去的距離。
+    跟 calculate_grasp_and_approach 裡 `grasp - approach_dist * z_axis` 是同一套算法，
+    這裡抽成獨立方法方便在番茄座標以外的情境重用（例如精定位目標）。"""
+    @staticmethod
+    def retreat_along_local_z(x, y, z, qx, qy, qz, qw, distance):
+        z_axis = R.from_quat([qx, qy, qz, qw]).as_matrix()[:, 2]
+        new_pos = np.array([x, y, z]) - distance * z_axis
+        return (float(new_pos[0]), float(new_pos[1]), float(new_pos[2]))
+
+    """繞著目標點 T=(x,y,z)，把姿態 (qx,qy,qz,qw) 繞「世界 Z 軸」(垂直軸，且是繞
+    T 這個點轉，不是繞原點)偏移 azimuth_offset_deg 度，再用轉過的新姿態對同一個 T
+    呼叫 retreat_along_local_z 退 distance 公尺。因為只是把「姿態」整組繞世界垂直軸
+    轉，新姿態的局部 Z 軸依然精確指向 T(面對目標無誤，局部 Z 軸的定義本來就是「鏡頭
+    指向 T」)，退出來的新位置到 T 的距離也精確還是 distance(在以 T 為圓心、半徑
+    distance 的球面上)；繞世界 Z 軸轉不影響任何向量的垂直分量，所以鏡頭的傾斜程度
+    (站得直不直)也不變，只有水平方位角在轉，效果像鏡頭繞著 T 水平掃視。
+    ★ joint_1 目標角 yaw：不是拿輸入的 yaw 直接加 azimuth_offset_deg。2026-09-04 實測
+    發現這樣算跟實際 IK 解出來的 joint_1 差距很大（偏移角越大差越多，甚至方向都反了）
+    ——因為「J1 轉多少度」只有繞著『基座自己的轉軸』轉時才等於方位角的偏移量，我們是
+    繞著 T(不在基座正上方)轉，兩者不能直接畫等號。改用跟 arm_task_node.py
+    _process_target 同一套公式 atan2(新位置.y, 新位置.x)——直接對「新算出來的鏡頭
+    座標」算方位角，實測比對跟真實 IK 解出來的 joint_1 誤差只有幾度，且跟著偏移角
+    增大也不會跑掉，比原本的加法準很多。這裡的 yaw 終究只是給 go_to_pose 的 J1 軟
+    提示(J1_TOLERANCE 容差內即可)，不用是精確到小數點的真解。
+    用在遮擋備用視角：跟主流程共用同一個目標點/退算函式，只換方位角。
+    回傳 (x,y,z,qx,qy,qz,qw,yaw)。"""
+    @staticmethod
+    def orbit_around_target(x, y, z, qx, qy, qz, qw, distance, azimuth_offset_deg):
+        theta = math.radians(azimuth_offset_deg)
+        rot_offset = R.from_euler('z', theta)
+        new_rot = rot_offset * R.from_quat([qx, qy, qz, qw])
+        nqx, nqy, nqz, nqw = new_rot.as_quat()
+        nx, ny, nz = MathUtils.retreat_along_local_z(x, y, z, nqx, nqy, nqz, nqw, distance)
+        new_yaw = math.atan2(ny, nx)
+        return (nx, ny, nz, float(nqx), float(nqy), float(nqz), float(nqw), new_yaw)

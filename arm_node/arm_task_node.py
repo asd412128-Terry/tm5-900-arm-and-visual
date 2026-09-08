@@ -54,7 +54,9 @@ class TM5MTaskNode(Node):
         self.pause_timer      = None
         self.grasp_target     = None
         self.approach_target  = None
+        self._return_home_retry_count = 0  # 回初始姿態失敗時的重試次數，成功或開始新一輪失敗處理時歸零
         self.scanning          = False
+        self._alt_pose_idx    = 0  # 下一個要試的遮擋備用視角索引，成功找到目標後歸零
 
         self.get_logger().info('大腦節點啟動！等待 MoveIt Server 連線...')
         self.startup_timer = self.create_timer(0.5, self._check_startup)
@@ -86,14 +88,33 @@ class TM5MTaskNode(Node):
         if not self.scanning:
             return
         self.scanning = False
+        self._alt_pose_idx = 0  # 找到目標了，下一輪重新從主視角開始試
         self._process_target(msg)
 
     def vision_status_callback(self, msg: String):
-        if msg.data != 'NO_TARGET':
-            return
         if not self.scanning:
             return
+
+        if msg.data == 'OCCLUDED':
+            self.scanning = False
+            if self._alt_pose_idx < len(config.ALT_VIEW_AZIMUTH_OFFSETS_DEG):
+                azimuth_offset_deg = config.ALT_VIEW_AZIMUTH_OFFSETS_DEG[self._alt_pose_idx]
+                self._alt_pose_idx += 1
+                self.get_logger().info(
+                    f'這輪候選全被判定遮擋，換備用視角 {self._alt_pose_idx}/'
+                    f'{len(config.ALT_VIEW_AZIMUTH_OFFSETS_DEG)}'
+                    f'（方位角偏移 {azimuth_offset_deg:+.0f}°）重新掃描...')
+                self._move_to_fine_alt(azimuth_offset_deg)
+            else:
+                self.get_logger().info('備用視角都試過了，還是被遮擋，回初始位置。')
+                self._alt_pose_idx = 0
+                self._finish_this_round()
+            return
+
+        if msg.data != 'NO_TARGET':
+            return
         self.scanning = False
+        self._alt_pose_idx = 0
         self.get_logger().info('vision 回報這輪沒有目標，準備回初始位置。')
         self._finish_this_round()
 
@@ -154,12 +175,22 @@ class TM5MTaskNode(Node):
         if not success:
             self.get_logger().warn('動作執行失敗！')
             if self.current_step == 'INIT':
-                self.get_logger().error('回初始姿態也失敗，停止重試，請人工檢查！')
-                self._reset_to_idle()
+                self._return_home_retry_count += 1
+                if self._return_home_retry_count < config.RETURN_HOME_MAX_RETRIES:
+                    self.get_logger().warn(
+                        f'回初始姿態失敗，重試 {self._return_home_retry_count}/'
+                        f'{config.RETURN_HOME_MAX_RETRIES}...')
+                    self._move_to_initial()
+                else:
+                    self.get_logger().error(
+                        f'回初始姿態重試 {config.RETURN_HOME_MAX_RETRIES} 次都失敗，'
+                        f'停止重試，請人工檢查！')
+                    self._reset_to_idle()
             else:
                 self.get_logger().warn('嘗試退回初始姿態...')
                 self.arm.control_gripper(config.GRIPPER_RELEASE)
                 self.current_step = 'INIT'
+                self._return_home_retry_count = 0
                 self._move_to_initial()
             return
 
@@ -171,6 +202,7 @@ class TM5MTaskNode(Node):
         step = self.current_step
 
         if step == 'INIT':
+            self._return_home_retry_count = 0
             self.get_logger().info('已回到初始位置，前往精定位姿態...')
             self._move_to_fine()
 
@@ -210,16 +242,44 @@ class TM5MTaskNode(Node):
         self.arm.go_to_joints(target, done_cb=self.on_action_completed)
 
     def _move_to_fine(self):
+        """一般精定位流程：走 go_to_pose（座標+姿態）。目標座標是即時算出來的——
+        拿粗定位（車用相機）算出的番茄座標+姿態，沿局部 Z 軸退 COARSE_TO_FINE_RETREAT_M
+        公尺，退到的位置才是精定位實際要到的點。車用相機還沒接上，先用
+        config.FAKE_COARSE_TOMATO_POSE 這組假座標頂著測，之後接上相機只要把
+        FAKE_COARSE_TOMATO_POSE 換成即時算出來的番茄座標，這裡的退算邏輯不用改。"""
+        self._clear_octomap_for_fine()
+        self.current_step = 'TO_FINE'
+        self.is_moving = True
+
+        cx, cy, cz, cqx, cqy, cqz, cqw, cyaw = config.FAKE_COARSE_TOMATO_POSE
+        fx, fy, fz = MathUtils.retreat_along_local_z(cx, cy, cz, cqx, cqy, cqz, cqw,
+                                                      config.COARSE_TO_FINE_RETREAT_M)
+        pose_tuple = (fx, fy, fz, cqx, cqy, cqz, cqw, cyaw)
+        self.arm.go_to_pose(pose_tuple, done_cb=self.on_action_completed)
+
+    def _move_to_fine_alt(self, azimuth_offset_deg):
+        """遮擋備用視角：繞著跟主流程同一個目標點（config.FAKE_COARSE_TOMATO_POSE
+        的座標），在半徑 config.COARSE_TO_FINE_RETREAT_M 的球面上，把姿態繞世界 Z
+        軸偏移 azimuth_offset_deg 度，算出新的座標+姿態（MathUtils.orbit_around_target）
+        ——距離跟「面對目標」都保證不變，只換方位角。跟主流程共用同一組退算邏輯，
+        之後接上真的車用相機、FAKE_COARSE_TOMATO_POSE 換成即時座標，這裡不用改。"""
+        self._clear_octomap_for_fine()
+        self.current_step = 'TO_FINE'
+        self.is_moving = True
+
+        cx, cy, cz, cqx, cqy, cqz, cqw, _cyaw = config.FAKE_COARSE_TOMATO_POSE
+        pose_tuple = MathUtils.orbit_around_target(
+            cx, cy, cz, cqx, cqy, cqz, cqw,
+            config.COARSE_TO_FINE_RETREAT_M, azimuth_offset_deg)
+        self.arm.go_to_pose(pose_tuple, done_cb=self.on_action_completed)
+
+    def _clear_octomap_for_fine(self):
         # ★ 只要「要去精定位」，不管從哪個分支呼叫過來，一律先清空 OctoMap，
         #   不用等到達、不依賴 current_step 判斷。
         if self.arm.clear_octomap_client.service_is_ready():
             self.arm.clear_octomap_client.call_async(Empty.Request())
         else:
             self.get_logger().warn('clear_octomap 服務尚未就緒，跳過清空。')
-        self.current_step = 'TO_FINE'
-        self.is_moving = True
-        target = [math.radians(deg) for deg in config.POSE_FINE_DEG]
-        self.arm.go_to_joints(target, done_cb=self.on_action_completed)
 
     def _enter_scanning(self):
         self.scanning = True
