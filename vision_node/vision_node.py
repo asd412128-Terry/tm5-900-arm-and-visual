@@ -23,6 +23,7 @@ import time
 import cv2
 import yaml
 import rclpy
+import tf2_geometry_msgs
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from rclpy.node import Node
@@ -60,6 +61,7 @@ class VisionNode(Node):
         self.get_logger().info(f'執行模式: {VISION_MODE}（VISION_MODE 環境變數切換），模型: {MODEL_PATH}')
         self.get_logger().info('正在載入 YOLOv11 果梗+番茄分割模型...')
         coord_estimator = CoordinateEstimator()
+        self.coord = coord_estimator   # 供 StemTracker 平滑完像素/深度後，重新反投影用
         skeletonizer = PedicelSkeletonizer()
         self.detector = ObjectDetector(MODEL_PATH, coordinate_estimator=coord_estimator,
                                         skeletonizer=skeletonizer,
@@ -105,6 +107,9 @@ class VisionNode(Node):
         self._occluded_scan_count = 0
         self._occluded_scan_grace = OCCLUDED_SCAN_GRACE
         self.latest_targets = []
+        # 互動選取中的候選清單（build_valid_candidates/refresh_valid 用的那份），非 None
+        # 時 CV2 視窗改用這份的編號畫框，跟終端機顯示同一套 ID，不要各自獨立編號。
+        self._interactive_valid = None
         self.latest_tomatoes = []
 
         # 啟動時直接讀入手動校正過的內參，之後 info_callback 收到 camera_info
@@ -239,22 +244,46 @@ class VisionNode(Node):
         self.latest_tomatoes = detected_tomatoes
         if len(detected_objects) > 0:
             detected_objects = self.stem_tracker.update(detected_objects)
+            # StemTracker 平滑的是像素座標+深度（源頭），不是 world_x/y/z、vx/vy/vz
+            # 本身——這裡才把平滑後的源頭資料，用跟單幀 fallback 同一套換算，各自
+            # 反投影一次，算出這一幀真正要用的抓取點世界座標跟方向向量。
+            for obj in detected_objects:
+                self._finalize_smoothed_stem(obj, fx, fy, ux_img, uy_img, trans, stamp)
             # StemTracker 視窗裡代表某根果梗的那一幀，可能是幾幀前留存的舊紀錄，
             # 它的 'paired_tomato' 是那時候留下的物件快照，不是這一幀 detected_tomatoes
             # 裡的同一個物件——重新指到這一幀真正的番茄物件，讓果梗畫框跟番茄畫框
             # 讀的是同一份 occluded 狀態，紅綠燈才會一起變，不會各跳各的。
             TargetSelector.resolve_live_pairing(detected_objects, detected_tomatoes)
-            detected_objects = sorted(detected_objects, key=lambda obj: obj['z_real'])
+            detected_objects = sorted(detected_objects, key=lambda obj: obj['z_center'])
         self.latest_targets = detected_objects
 
         # 番茄框（紅/綠）畫在這裡；就算這幀沒偵測到任何果梗，只要有番茄還是要畫出來，
         # 不能因為 detected_objects 是空的就整個跳過。
         if len(detected_objects) > 0 or len(detected_tomatoes) > 0:
-            self.visualizer.draw_tracked_overlay(cv_image, detected_objects, detected_tomatoes)
+            self.visualizer.draw_tracked_overlay(cv_image, detected_objects, detected_tomatoes,
+                                                  valid=self._interactive_valid)
 
         self._maybe_print_and_trigger_pick(detected_objects)
 
         self._show(cv_image)
+
+    """StemTracker 平滑完的是像素座標+深度（源頭），這裡把平滑後的抓取點/calyx端/branch端
+    (px,py,z) 各自反投影一次，原地覆寫 obj 的 world_x/y/z、vx/vy/vz——覆寫前這兩組欄位是
+    『這一幀』的舊值，沒有意義。跟 detector.py 算單幀 fallback 用同一套
+    CoordinateEstimator 函式，兩邊算法保證一致。"""
+    def _finalize_smoothed_stem(self, obj, fx, fy, ux_img, uy_img, trans, stamp):
+        local_point = self.coord.backproject_to_local_point(
+            obj['cx'], obj['cy'], obj['z_center'], fx, fy, ux_img, uy_img, stamp=stamp)
+        world_point = tf2_geometry_msgs.do_transform_point(local_point, trans)
+        if all(math.isfinite(v) for v in (world_point.point.x, world_point.point.y, world_point.point.z)):
+            obj['world_x'] = world_point.point.x
+            obj['world_y'] = world_point.point.y
+            obj['world_z'] = world_point.point.z
+
+        obj['vx'], obj['vy'], obj['vz'] = self.coord.pixel_depth_pair_to_unit_vector(
+            obj['calyx_px'], obj['calyx_py'], obj['calyx_z'],
+            obj['branch_px'], obj['branch_py'], obj['branch_z'],
+            fx, fy, ux_img, uy_img, trans)
 
     """把 cv_image 放大 DISPLAY_SCALE 倍後顯示，只影響視窗大小，不影響偵測/座標計算。"""
     def _show(self, cv_image):
@@ -326,11 +355,18 @@ class VisionNode(Node):
             return
 
         self._occluded_scan_count = 0
+        miss_counts = []   # [(position, miss), ...]，用位置當識別鍵（見 refresh_valid 註解）
+        # prompt_choose_id 內部用 valid.clear()/valid.update() 原地更新這個 dict（不是
+        # 重新賦值），所以 self._interactive_valid 指到同一個物件，會自動跟著即時更新，
+        # CV2 視窗讀到的永遠是當下這一份。
+        self._interactive_valid = valid
         answer = self.target_selector.prompt_choose_id(
             valid,
             refresh_fn=lambda v: self.target_selector.refresh_valid(
-                v, self.latest_targets, self.target_selector.max_reach_m),
+                v, self.latest_targets, self.target_selector.max_reach_m,
+                miss_counts=miss_counts),
             invalid_reasons=invalid_reasons)
+        self._interactive_valid = None
 
         if answer == 's':
             print("略過這輪，不夾取，通知手臂回初始位置。")

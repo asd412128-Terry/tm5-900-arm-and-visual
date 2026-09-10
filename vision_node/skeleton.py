@@ -104,33 +104,6 @@ class PedicelSkeletonizer:
         idx = min(int(n * ratio), n - 1)
         return ordered_path[idx], idx
 
-    """依「目標像素距離」從果實端 (path[0]) 沿路徑找抓取點；這根果梗的總長度(像素弧長)
-    不夠長、量不到目標距離時，退回 ratio_min~ratio_max 之間的比例（依總長度佔目標距離
-    的比例內插：越接近量得到目標距離，比例越靠近 ratio_max），確保抓取點一定落在路徑範圍內。
-    適合果梗長度差異大的情境；果梗普遍偏短時這個目標距離容易逼近整根長度，改用
-    find_grasp_point_by_ratio 比較安全（見 config.py 的 GRASP_METHOD）。"""
-    @staticmethod
-    def find_grasp_point_by_distance(ordered_path: list, target_px_dist: float,
-                                      ratio_min: float, ratio_max: float):
-        n = len(ordered_path)
-        if n < 2:
-            return None
-
-        cum = [0.0]
-        for k in range(1, n):
-            y1, x1 = ordered_path[k - 1]
-            y2, x2 = ordered_path[k]
-            cum.append(cum[-1] + math.hypot(x2 - x1, y2 - y1))
-        total_len = cum[-1]
-
-        if total_len >= target_px_dist:
-            idx = next(k for k, d in enumerate(cum) if d >= target_px_dist)
-        else:
-            coverage = total_len / target_px_dist if target_px_dist > 0 else 0.0
-            ratio = ratio_min + (ratio_max - ratio_min) * coverage
-            idx = min(int(n * ratio), n - 1)
-        return ordered_path[idx], idx
-
     """用抓取點前後一小段路徑估計果梗生長角度（度）。"""
     @staticmethod
     def compute_growth_angle(ordered_path: list, grasp_idx: int, window: int = 10):
@@ -145,15 +118,16 @@ class PedicelSkeletonizer:
         angle_rad = math.atan2(dx, -(dy))
         return math.degrees(angle_rad)
     
-    """公開 API：果梗 mask → (grasp_x, grasp_y, angle_deg, ordered_path, grasp_idx)。
+    """公開 API（'ratio' 模式用）：果梗 mask → (grasp_x, grasp_y, angle_deg, ordered_path, grasp_idx)。
     reverse 見 order_skeleton_path——是否要把路徑反過來排，由呼叫端根據哪端真正
-    靠近配對到的番茄（3D 世界座標）決定，這裡不判斷方向。
-    target_px_dist 不給(None)就走固定比例法；有給就走固定距離法(太短退回比例)——
-    由呼叫端依 config.py 的 GRASP_METHOD 決定要不要算、傳什麼進來，這裡只負責照做。
-    任何一步失敗都回傳 None。"""
+    靠近配對到的番茄（3D 世界座標）決定，這裡不判斷方向。任何一步失敗都回傳 None。
+    'distance' 模式（GRASP_METHOD='distance'）需要逐點深度，屬於 coordinates.py 的職責
+    （這裡刻意只碰 2D 像素，不碰深度），呼叫端改成自己呼叫 skeletonize_pedicel +
+    order_skeleton_path 拿 ordered_path，再交給 CoordinateEstimator.find_grasp_point_by_3d_distance()，
+    見 detector.py 的 _finish_stem_detection。"""
     @classmethod
     def get_stem_grasp_point(cls, mask: np.ndarray, ratio_min: float, ratio_max: float,
-                              target_px_dist: float = None, reverse: bool = False):
+                              reverse: bool = False):
 
         clean, eroded, skeleton = cls.skeletonize_pedicel(mask)
         if skeleton is None:
@@ -161,10 +135,7 @@ class PedicelSkeletonizer:
         ordered_path = cls.order_skeleton_path(skeleton, reverse=reverse)
         if len(ordered_path) < 2:
             return None
-        if target_px_dist is None:
-            result = cls.find_grasp_point_by_ratio(ordered_path, ratio_min, ratio_max)
-        else:
-            result = cls.find_grasp_point_by_distance(ordered_path, target_px_dist, ratio_min, ratio_max)
+        result = cls.find_grasp_point_by_ratio(ordered_path, ratio_min, ratio_max)
         if result is None:
             return None
         grasp_point, grasp_idx = result

@@ -13,9 +13,9 @@ import math
 import numpy as np
 import tf2_geometry_msgs
 from ultralytics import YOLO
-from .config import (GRASP_METHOD, GRASP_RATIO_MAX, GRASP_RATIO_MIN, GRASP_TARGET_DIST_M,
-                      MIN_VALID_DEPTH_M, OVERLAP_SUPPRESS_THRESH, STEM_CLASS_ID,
-                      TOMATO_CLASS_ID, DEPTH_WINDOW, MIN_STEM_DEPTH_PX, YOLO_IOU)
+from .config import (GRASP_DISTANCE_MODE, GRASP_METHOD, GRASP_RATIO_MAX, GRASP_RATIO_MIN,
+                      GRASP_TARGET_DIST_M, MIN_VALID_DEPTH_M, OVERLAP_SUPPRESS_THRESH,
+                      STEM_CLASS_ID, TOMATO_CLASS_ID, DEPTH_WINDOW, MIN_STEM_DEPTH_PX, YOLO_IOU)
 from .coordinates import CoordinateEstimator
 from .occlusion import OcclusionChecker
 from .skeleton import PedicelSkeletonizer
@@ -40,6 +40,7 @@ class ObjectDetector:
         self.skeletonizer = skeletonizer or PedicelSkeletonizer()
         self.occlusion = occlusion_checker or OcclusionChecker()
         self._prev_pairs = []   # 上一幀配對結果 [(stem_pos, tomato_pos), ...]，供配對做時間穩定用
+        self._prev_reverse = []  # 上一幀「哪端是果實端」判定 [(stem_pos, is_end1), ...]，同樣供時間穩定用
 
     """多個果梗 mask 互相重疊超過門檻時，只保留面積較大的那個 (避免同一根果梗被偵測兩次)。"""
     @staticmethod
@@ -118,9 +119,11 @@ class ObjectDetector:
                         prepared.append(p)
 
                 pairs, reverse_map = TargetSelector.assign_stem_tomato_pairs(
-                    prepared, detected_tomatoes, prev_pairs=self._prev_pairs)
+                    prepared, detected_tomatoes, prev_pairs=self._prev_pairs,
+                    prev_reverse=self._prev_reverse)
 
                 new_prev_pairs = []
+                new_prev_reverse = []
                 for p in prepared:
                     anchor_t = pairs.get(id(p))
                     if anchor_t is None:
@@ -129,9 +132,11 @@ class ObjectDetector:
                     fingerprint = tuple((a + b) / 2.0 for a, b in zip(p['end0_world'], p['end1_world']))
                     new_prev_pairs.append((fingerprint,
                                             (anchor_t['world_x'], anchor_t['world_y'], anchor_t['world_z'])))
+                    new_prev_reverse.append((fingerprint, reverse))
                     self._finish_stem_detection(p, anchor_t, reverse, fx, fy, ux_img, uy_img, trans, depth_img,
                                                  confs_all, detected_objects, stamp)
                 self._prev_pairs = new_prev_pairs
+                self._prev_reverse = new_prev_reverse
 
         return detected_tomatoes, detected_objects
 
@@ -179,7 +184,8 @@ class ObjectDetector:
             'cx': cx_t, 'cy': cy_t,
             'bbox': b,
             'world_x': wp.point.x, 'world_y': wp.point.y, 'world_z': wp.point.z,
-            'depth': z_t,   # 表面深度 (相機讀到的原始深度，公尺，尚未加上番茄半徑)
+            'depth': z_t,        # 表面深度 (相機讀到的原始深度，公尺，尚未加上番茄半徑)
+            'z_center': z_center_t,   # 加上番茄半徑後的中心深度，跟 world_x/y/z 用同一個值算出來的，供果梗端平滑用
             'mask': mask_bin_t,
             'occluded': occluded,
             'occlusion_reason': occlusion_reason,
@@ -239,28 +245,45 @@ class ObjectDetector:
                                 confs_all, detected_objects, stamp=None):
         b, i, mask_bin = prep['b'], prep['i'], prep['mask_bin']
 
-        # GRASP_METHOD='distance' 才需要換算 target_px_dist：calyx_px 是已經確定的 C 點，
-        # 在它旁邊重新取深度換算（不是用第一階段的骨架中點深度——果梗對相機有夾角時
-        # 中點深度可能跟 C 點深度差不少，換算會系統性偏）。'ratio' 模式不需要，直接跳過。
-        target_px_dist = None
+        # 'distance' 模式要逐點量深度、轉 3D 座標再算弧長（見 coordinates.py
+        # find_grasp_point_by_3d_distance 的說明），這裡自己拿 ordered_path 交給它；
+        # 'ratio' 模式維持原本純 2D 骨架流程，直接用 get_stem_grasp_point。
         if GRASP_METHOD == 'distance':
-            calyx_px = prep['end1_px'] if reverse else prep['end0_px']
-            calyx_z = self.coord.median_depth_in_mask(depth_img, mask_bin, self.min_stem_depth_px,
-                                                        cx=calyx_px[0], cy=calyx_px[1])
-            if calyx_z is None:
+            clean, eroded, skeleton = self.skeletonizer.skeletonize_pedicel(mask_bin)
+            if skeleton is None:
                 return
-            calyx_z = self.coord.to_meters(calyx_z)
-            if calyx_z <= MIN_VALID_DEPTH_M:
+            ordered_path = self.skeletonizer.order_skeleton_path(skeleton, reverse=reverse)
+            if len(ordered_path) < 2:
                 return
-            target_px_dist = GRASP_TARGET_DIST_M * fx / calyx_z
-
-        grasp = self.skeletonizer.get_stem_grasp_point(mask_bin, GRASP_RATIO_MIN, GRASP_RATIO_MAX,
-                                                         target_px_dist=target_px_dist, reverse=reverse)
-        if grasp is None:
-            return
-        cx_pixel, cy_pixel, stem_angle, ordered_path, grasp_idx = grasp
+            if GRASP_DISTANCE_MODE == 'chord_ratio':
+                result = self.coord.find_grasp_point_by_chord_ratio(
+                    ordered_path, mask_bin, depth_img, fx, fy, ux_img, uy_img, GRASP_TARGET_DIST_M)
+            else:
+                result = self.coord.find_grasp_point_by_3d_distance(
+                    ordered_path, mask_bin, depth_img, fx, fy, ux_img, uy_img,
+                    GRASP_TARGET_DIST_M, GRASP_RATIO_MIN, GRASP_RATIO_MAX)
+            if result is None:
+                return
+            grasp_point, grasp_idx = result
+            gy, gx = grasp_point
+            cx_pixel, cy_pixel = int(gx), int(gy)
+            stem_angle = self.skeletonizer.compute_growth_angle(ordered_path, grasp_idx)
+        else:
+            grasp = self.skeletonizer.get_stem_grasp_point(mask_bin, GRASP_RATIO_MIN, GRASP_RATIO_MAX,
+                                                             reverse=reverse)
+            if grasp is None:
+                return
+            cx_pixel, cy_pixel, stem_angle, ordered_path, grasp_idx = grasp
         tip_y, tip_x = ordered_path[0]      # 判定為果實端(calyx)的端點像素座標
         root_y, root_x = ordered_path[-1]   # 判定為枝條端(branch)的端點像素座標
+
+        # 骨架兩端點各自的深度（之前只存了像素座標，沒量深度，沒辦法平滑）
+        tip_z = self.coord.median_depth_for_stem(depth_img, mask_bin, tip_x, tip_y,
+                                                   DEPTH_WINDOW, self.min_stem_depth_px)
+        tip_z = self.coord.to_meters(tip_z) if tip_z is not None else None
+        root_z = self.coord.median_depth_for_stem(depth_img, mask_bin, root_x, root_y,
+                                                     DEPTH_WINDOW, self.min_stem_depth_px)
+        root_z = self.coord.to_meters(root_z) if root_z is not None else None
 
         pedicel_dir = self.coord.estimate_pedicel_direction(
             ordered_path, grasp_idx, depth_img,
@@ -283,7 +306,25 @@ class ObjectDetector:
         if not all(math.isfinite(v) for v in (world_point.point.x, world_point.point.y, world_point.point.z)):
             return
 
-        vx, vy, vz = pedicel_dir if pedicel_dir is not None else (0.0, 0.0, -1.0)
+        # pedicel_dir 是 dict（見 estimate_pedicel_direction）：這一幀當場算出的 vx/vy/vz，
+        # 加上 calyx/branch 兩端的『像素座標+深度』源頭資料——後者才是 StemTracker 要拿去
+        # 跨幀平滑的東西，平滑完再反投影一次，不是平滑這裡算出來的 vx/vy/vz。算不出來就用
+        # 抓取點自己的像素+深度頂替兩端，等於這一幀的向量退化成 (0,0,-1)（垂直向下）。
+        if pedicel_dir is not None:
+            vx, vy, vz = pedicel_dir['vx'], pedicel_dir['vy'], pedicel_dir['vz']
+            calyx_px, calyx_py, calyx_z = pedicel_dir['calyx_px'], pedicel_dir['calyx_py'], pedicel_dir['calyx_z']
+            branch_px, branch_py, branch_z = (pedicel_dir['branch_px'], pedicel_dir['branch_py'],
+                                               pedicel_dir['branch_z'])
+        else:
+            vx, vy, vz = 0.0, 0.0, -1.0
+            calyx_px, calyx_py, calyx_z = cx_pixel, cy_pixel, z_center
+            branch_px, branch_py, branch_z = cx_pixel, cy_pixel, z_center
+
+        # 骨架兩端點的深度量不到就退回抓取點自己的深度，不要讓 None 混進平滑歷史
+        if tip_z is None:
+            tip_z = z_center
+        if root_z is None:
+            root_z = z_center
 
         detected_objects.append({
             'bbox': b,
@@ -293,12 +334,24 @@ class ObjectDetector:
             'world_y': world_point.point.y,
             'world_z': world_point.point.z,
             'path_len': len(ordered_path),        # debug：骨架路徑點數，抓取點亂跳時比對用
+            'grasp_idx': grasp_idx,               # debug：抓取點在骨架路徑上的索引，方向向量亂跳時比對用
             'tip_px': (tip_x, tip_y),              # 判定為果實端(calyx)的端點像素座標
             'root_px': (root_x, root_y),           # 判定為枝條端(branch)的端點像素座標
             'end0_px': prep['end0_px'],            # 兩個原始候選端點(未判斷方向前)，畫面比對用
             'end1_px': prep['end1_px'],
             'angle': stem_angle,
             'vx': vx, 'vy': vy, 'vz': vz,
+            # 方向向量的源頭資料（像素+相機座標系深度，未反投影）：跨幀平滑用這組，不是 vx/vy/vz
+            'calyx_px': calyx_px, 'calyx_py': calyx_py, 'calyx_z': calyx_z,
+            'branch_px': branch_px, 'branch_py': branch_py, 'branch_z': branch_z,
+            # 骨架兩端點（真正的路徑頭尾，不是 calyx/branch 那兩簇）的像素+深度，供平滑用
+            'tip_x': float(tip_x), 'tip_y': float(tip_y), 'tip_z': tip_z,
+            'root_x': float(root_x), 'root_y': float(root_y), 'root_z': root_z,
+            # 配對到的番茄中心，像素+深度，供平滑用（跟 TomatoTracker 自己的平滑是分開的
+            # 兩套機制，這裡是要讓果梗這邊的向量計算，能在同一個時間窗口裡取用番茄中心）
+            'tomato_cx': float(anchor_t.get('cx', cx_pixel)),
+            'tomato_cy': float(anchor_t.get('cy', cy_pixel)),
+            'tomato_z': float(anchor_t.get('z_center', anchor_t.get('depth', z_center))),
             'conf': float(confs_all[i]),
             'mask': mask_bin,   # 果梗二值遮罩，供選定為目標時的點雲過濾用
             'paired_tomato': anchor_t,   # 配對只在這裡算一次，後面一律讀這個欄位，不重新配對

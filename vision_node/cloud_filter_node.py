@@ -48,6 +48,16 @@ VISION_MODE = os.environ.get('VISION_MODE', 'real').strip().lower()
 if VISION_MODE not in ('real', 'isaac'):
     VISION_MODE = 'isaac'
 
+# 原始點雲 topic 也依 VISION_MODE 切換：
+#   real  → realsense-ros driver 發布的原始點雲（雙層 camera/camera 前綴、路徑含 color）
+#   isaac → Isaac Sim 的點雲 topic（單層 camera 前綴），跟本檔其他地方原本寫死的
+#           '/camera/depth/points' 是同一個，只是那個值其實只對 isaac 成立。
+_POINTS_TOPIC_BY_MODE = {
+    'real':  '/camera/camera/depth/color/points',
+    'isaac': '/camera/depth/points',
+}
+POINTS_TOPIC = _POINTS_TOPIC_BY_MODE[VISION_MODE]
+
 # k[0]=fx, k[4]=fy, k[2]=cx, k[5]=cy。
 # 2026-09-02 用 `ros2 topic echo /camera/camera_info --once` 在 Isaac Sim 下實測。
 _ISAAC_INTRINSICS = {'fx': 1108.5125019853992, 'fy': 1108.5125019853992, 'cx': 640.0, 'cy': 360.0}
@@ -92,7 +102,7 @@ class CloudFilterNode(Node):
         self.declare_parameter('cy', intr['cy'])
 
         self.sub_cloud = self.create_subscription(
-            PointCloud2, '/camera/depth/points', self.cloud_callback, qos_profile_sensor_data)
+            PointCloud2, POINTS_TOPIC, self.cloud_callback, qos_profile_sensor_data)
         self.sub_mask = self.create_subscription(
             Image, '/target_filter_mask', self.mask_callback, 10)
 

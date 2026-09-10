@@ -16,7 +16,7 @@ import termios
 import time
 import unicodedata
 from .config import (CANDIDATE_REFRESH_INTERVAL_SEC, MAX_REACH_M, PAIR_STICKY_DISCOUNT,
-                      PAIR_STICKY_MATCH_DIST_M)
+                      PAIR_STICKY_MATCH_DIST_M, REFRESH_VALID_MAX_MISS)
 
 
 """中文等全形字元在終端機上佔 2 個字元寬，照 len() 算行寬會低估，導致遊標上移
@@ -64,7 +64,8 @@ class TargetSelector:
     在兩顆番茄間跳，畫面紅綠燈閃爍。折扣只影響排序，真的有更近的番茄還是會配走，
     不會卡死在錯誤配對上。"""
     @staticmethod
-    def assign_stem_tomato_pairs(stems: list, tomatoes: list, prev_pairs: list = None):
+    def assign_stem_tomato_pairs(stems: list, tomatoes: list, prev_pairs: list = None,
+                                  prev_reverse: list = None):
         if not stems or not tomatoes:
             return {}, {}
 
@@ -79,10 +80,25 @@ class TargetSelector:
                     return prev_tomato_pos
             return None
 
+        # ★ 2026-09-09：哪端是果實端(is_end1/reverse)原本每幀從零重算，兩端到番茄
+        # 距離接近時，端點深度雜訊會讓判定結果每幀亂翻，翻了整條骨架路徑順序就反過來，
+        # 果梗一彎，算出來的方向向量會差很多、不只是正負號相反（實測：位置、信心都沒變，
+        # 方向卻在 (0.15,0.24,-0.96) 和 (-0.98,-0.11,-0.15) 之間跳，就是這裡沒有時間
+        # 穩定性造成的）。比照上面番茄配對已經在用的 sticky 折扣，同一招用在選端上：
+        # 跟上一幀判定同一端，距離打折，沒有明確證據（新端真的近很多）就不要翻。
+        def _sticky_is_end1(fingerprint):
+            if not prev_reverse:
+                return None
+            for prev_fingerprint, prev_is_end1 in prev_reverse:
+                if math.dist(fingerprint, prev_fingerprint) < PAIR_STICKY_MATCH_DIST_M:
+                    return prev_is_end1
+            return None
+
         candidates = []   # (distance, stem, tomato, is_end1)
         for s in stems:
             fingerprint = tuple((a + b) / 2.0 for a, b in zip(s['end0_world'], s['end1_world']))
             sticky_tomato_pos = _sticky_tomato_pos(fingerprint)
+            sticky_is_end1 = _sticky_is_end1(fingerprint)
             for t in tomatoes:
                 t_pos = _tomato_anchor(t)
                 sticky = (sticky_tomato_pos is not None and
@@ -90,6 +106,8 @@ class TargetSelector:
                 for is_end1, ep in ((False, s['end0_world']), (True, s['end1_world'])):
                     d = math.dist(ep, t_pos)
                     if sticky:
+                        d *= PAIR_STICKY_DISCOUNT
+                    if sticky_is_end1 is not None and is_end1 == sticky_is_end1:
                         d *= PAIR_STICKY_DISCOUNT
                     candidates.append((d, s, t, is_end1))
         candidates.sort(key=lambda c: c[0])
@@ -157,8 +175,10 @@ class TargetSelector:
         return True, "", distance_to_base
 
     """先用 check_candidate 把全部候選分成三堆：能夾、有配對到番茄但暫時被判定遮擋、
-    其他原因不能夾（沒配對到/超出安全範圍/向量異常）。前兩堆一起依配對番茄的深度
-    （離相機的距離；沒配對到番茄的退回果梗自己的 z_real）由近到遠重新編號（0 起算），
+    其他原因不能夾（沒配對到/超出安全範圍/向量異常）。能夾的依配對番茄的深度（離相機
+    的距離；沒配對到番茄的退回果梗自己的 z_center，StemTracker 平滑過的深度，不是
+    單幀原始值 z_real）由近到遠排在前面，被遮擋的排在後面（同樣依深度排），兩堆合
+    起來一起重新編號（0 起算，能夾的一定排在被遮擋的前面）。
     第三堆不佔用編號、只列原因參考用——遮擋是追蹤結果會隨時間變動的暫時狀態，讓它
     跟能夾的候選一起佔編號、一起進即時面板，遮擋解除時使用者馬上看得到、選得到；
     其他原因是結構性問題不會自己恢復，維持原本只列參考不佔編號的做法。
@@ -172,22 +192,27 @@ class TargetSelector:
     def build_valid_candidates(self, targets: list):
         def _depth_key(t):
             nt = t.get('paired_tomato')
-            return nt['depth'] if nt is not None else t['z_real']
-        order = sorted(range(len(targets)), key=lambda i: _depth_key(targets[i]))
+            return nt['depth'] if nt is not None else t['z_center']
+
+        # 可選的（pickable_list）跟暫時被遮擋的（occluded_list）分開排序、分開存，
+        # 各自依深度近到遠排完，可選的接在前面、被遮擋的接在後面才編號——已失效/不能
+        # 選的排最後，不要跟可選的混在一起用深度排序。
+        pickable_list, occluded_list, rejected = [], [], []
+        for target in targets:
+            ok, reason, distance_to_base = self.check_candidate(target, self.max_reach_m)
+            if not ok and not reason.startswith('配對番茄被判定遮擋'):
+                rejected.append(reason)   # 除了「配對番茄被判定遮擋」以外的其他排除原因，只列原因，不佔編號
+                continue
+            entry = (target, ok, reason, distance_to_base)
+            (pickable_list if ok else occluded_list).append(entry)
+
+        pickable_list.sort(key=lambda e: _depth_key(e[0]))
+        occluded_list.sort(key=lambda e: _depth_key(e[0]))
 
         valid = {}
         invalid_reasons = {}
-        rejected = []   # 除了「配對番茄被判定遮擋」以外的其他排除原因，只列原因，不佔編號
-        for idx in order:
-            target = targets[idx]
-
-            ok, reason, distance_to_base = self.check_candidate(target, self.max_reach_m)
-            if not ok and not reason.startswith('配對番茄被判定遮擋'):
-                rejected.append(reason)
-                continue
-
+        for vid, (target, ok, reason, distance_to_base) in enumerate(pickable_list + occluded_list):
             vx, vy, vz = target.get('vx', 0.0), target.get('vy', 0.0), target.get('vz', -1.0)
-            vid = len(valid)
             valid[vid] = (target, vx, vy, vz, distance_to_base)
             if not ok:
                 invalid_reasons[vid] = reason
@@ -205,18 +230,44 @@ class TargetSelector:
         all_occluded = (not pickable and bool(valid) and not rejected)
         return valid, invalid_reasons, all_occluded
     
-    """把 valid 裡每個候選（编號固定）重新比對到『目前最新一幀』的座標：位置在
-    max_dist_m 內視為同一根果梗，就地更新座標/vx,vy,vz/distance_to_base；找不到
-    夠近的、或更新後 check_candidate 判定不合格，該編號標成失效（原因寫進
-    invalid_reasons），但仍留在 valid 裡佔著原本的編號——編號在整個選取過程中
-    固定不重排，避免使用者輸入的 ID 在等待期間指向別的物理目標。
+    """把 valid 裡每個候選重新比對到『目前最新一幀』的座標：位置在 max_dist_m 內視為
+    同一根果梗，就地更新座標/vx,vy,vz/distance_to_base；找不到夠近的、或更新後
+    check_candidate 判定不合格，標成失效（原因寫進 invalid_reasons）。
+    ★ 2026-09-09：編號改成每次呼叫都依『目前』深度（z_center）由近到遠重新分配
+    （0 永遠是目前最近的），不再是整輪選取期間固定不變——雖然這代表使用者打字打到
+    一半，深度更新時號碼理論上可能改指向別的物理目標，但這是使用者要的行為（要用
+    「目前最近」的當下狀態選取，不是選取當下那一刻的固定順序）。miss_counts 追蹤的
+    是「連續配不到幾次」，用來抓 target_selector.py 這邊比對用的內部索引（沿用上一輪
+    的 old vid，不是新編號），重新編號後才搬到新編號下，確保容忍邏輯不會因為重編號
+    就跟丟。
+    ★ 「找不到夠近的」這個原因不會單幀立刻判失效：2026-09-09 實測證實，即使
+    grasp_idx/取樣像素完全沒變，深度相機在同一位置讀出來的 3D 座標偶爾還是會跳掉
+    （深度感測雜訊，不是演算法問題，細節見 PROGRESS.md）；YOLO 單幀漏偵測也是同一種
+    「這一幀量測不能信、很快就恢復」的情況。超過 REFRESH_VALID_MAX_MISS 才真的判
+    失效，避免面板一直閃。check_candidate 判定不合格（座標異常/超出範圍/沒配對到
+    番茄/被遮擋/向量 NaN）是結構性問題、拿到的是「這一幀真的配對到」的量測，不受
+    這個容忍影響，一律立刻判失效。
     回傳 (new_valid, invalid_reasons)。"""
     @staticmethod
     def refresh_valid(valid: dict, latest_targets: list, max_reach_m: float,
-                       max_dist_m: float = PAIR_STICKY_MATCH_DIST_M):
-        new_valid = {}
-        invalid_reasons = {}
-        for vid, (target, vx, vy, vz, distance_to_base) in valid.items():
+                       max_dist_m: float = PAIR_STICKY_MATCH_DIST_M,
+                       miss_counts: list = None, max_miss: int = REFRESH_VALID_MAX_MISS):
+        # ★ miss_counts 是 list [(position, miss), ...]，用『位置』當識別鍵，不能用
+        # vid——vid 現在每次都依當下深度重新分配，兩個候選深度排名互換時，『編號 0』
+        # 這次指的物理目標可能已經不是上次『編號 0』那個了，拿編號當鍵會把容忍次數
+        # 算到錯的目標上（2026-09-09 修過一次用 vid 當鍵，是錯的，改成位置）。
+        if miss_counts is None:
+            miss_counts = []
+
+        def _prev_miss(pos):
+            for p, m in miss_counts:
+                if math.dist(pos, p) < max_dist_m:
+                    return m
+            return 0
+
+        # 先照舊編號逐一比對更新（沿用原本的比對/容忍邏輯），暫存結果，還不決定新編號
+        updated = []   # [(target, vx, vy, vz, distance_to_base, reason_or_None, miss, pos)]
+        for old_vid, (target, vx, vy, vz, distance_to_base) in valid.items():
             old_pos = (target['world_x'], target['world_y'], target['world_z'])
             match, match_d = None, max_dist_m
             for t in latest_targets:
@@ -225,24 +276,41 @@ class TargetSelector:
                     match, match_d = t, d
 
             if match is None:
-                new_valid[vid] = (target, vx, vy, vz, distance_to_base)
-                invalid_reasons[vid] = "目標消失或移動過大"
+                miss = _prev_miss(old_pos) + 1
+                reason = "目標消失或移動過大" if miss > max_miss else None
+                updated.append((target, vx, vy, vz, distance_to_base, reason, miss, old_pos))
                 continue
 
             ok, reason, new_distance = TargetSelector.check_candidate(match, max_reach_m)
             new_vx = match.get('vx', 0.0)
             new_vy = match.get('vy', 0.0)
             new_vz = match.get('vz', -1.0)
-            new_valid[vid] = (match, new_vx, new_vy, new_vz, new_distance)
-            if not ok:
-                invalid_reasons[vid] = reason
+            new_pos = (match['world_x'], match['world_y'], match['world_z'])
+            updated.append((match, new_vx, new_vy, new_vz, new_distance, None if ok else reason, 0, new_pos))
+
+        # 依「能不能選、目前深度」重新排序、重新編號：可選的排前面（依深度近到遠），
+        # 已失效的一律排最後（同樣依深度近到遠）；miss_counts 改存這一輪每個候選的
+        # 『位置』，下次呼叫用位置比對，不受編號重排影響
+        updated.sort(key=lambda u: (u[5] is not None, u[0]['z_center']))
+        new_valid = {}
+        invalid_reasons = {}
+        new_miss_list = []
+        for new_vid, (target, vx, vy, vz, distance_to_base, reason, miss, pos) in enumerate(updated):
+            new_valid[new_vid] = (target, vx, vy, vz, distance_to_base)
+            new_miss_list.append((pos, miss))
+            if reason:
+                invalid_reasons[new_vid] = reason
+        miss_counts[:] = new_miss_list
         return new_valid, invalid_reasons
 
     """把 valid 排版成即時面板要印的每一行文字（失效的候選附註原因），純格式化不列印。"""
     @staticmethod
     def _format_candidate_lines(valid: dict, invalid_reasons: dict) -> list:
         lines = []
-        for vid in sorted(valid.keys()):
+        # 編號跟顯示順序都是 refresh_valid() 每次重繪時依「能不能選、目前深度」重新
+        # 分配的（可選的排前面依深度近到遠，已失效的排最後），這裡再排一次是為了跟
+        # build_valid_candidates 剛列出來、還沒跑過 refresh_valid 的第一次畫面一致。
+        for vid in sorted(valid.keys(), key=lambda v: (v in invalid_reasons, valid[v][0]['z_center'])):
             target, vx, vy, vz, distance_to_base = valid[vid]
             reason = invalid_reasons.get(vid)
             if reason and reason.startswith('配對番茄被判定遮擋'):
@@ -252,9 +320,14 @@ class TargetSelector:
             else:
                 tag = ""
             lines.append(
-                f"  [ID:{vid}] 深度={target['z_real']:.3f}m | X={target['world_x']:.3f}, "
+                f"  [ID:{vid}] 果梗 深度={target['z_center']:.3f}m | X={target['world_x']:.3f}, "
                 f"Y={target['world_y']:.3f}, Z={target['world_z']:.3f}"
                 f"（距基座 {distance_to_base:.3f} 公尺） | Vector:[{vx:.2f}, {vy:.2f}, {vz:.2f}]{tag}")
+            nt = target.get('paired_tomato')
+            if nt is not None:
+                lines.append(
+                    f"         番茄 深度={nt.get('depth', 0.0):.3f}m | X={nt['world_x']:.3f}, "
+                    f"Y={nt['world_y']:.3f}, Z={nt['world_z']:.3f}")
         return lines
 
     """終端機互動選取目標 ID，等待輸入期間原地即時更新候選座標（不往下滾動畫面）。
@@ -283,7 +356,8 @@ class TargetSelector:
         last_refresh = time.time()
 
         def valid_ids_str():
-            return ", ".join(str(i) for i in sorted(valid.keys()) if i not in invalid_reasons)
+            ids = sorted(valid.keys(), key=lambda v: valid[v][0]['z_center'])
+            return ", ".join(str(i) for i in ids if i not in invalid_reasons)
 
         def redraw():
             nonlocal last_total_rows

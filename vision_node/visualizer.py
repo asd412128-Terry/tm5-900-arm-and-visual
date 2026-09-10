@@ -15,45 +15,72 @@ class Visualizer:
 
     """在畫面上畫出果梗框線/中心點（用 TargetSelector.check_candidate 跟實際篩選邏輯同一套
     標準判斷能不能夾：綠色=可以夾，紅色=不能夾），以及番茄框線（有配對到果梗+沒被遮擋才綠色），
-    並疊加資訊面板。"""
-    def draw_tracked_overlay(self, cv_image, detected_objects, detected_tomatoes):
+    並疊加資訊面板。
+    ★ 2026-09-09：valid 是互動選取中的候選 dict（vision_node.py 的 self._interactive_valid，
+    build_valid_candidates/refresh_valid 那份）。不是 None 時，**直接拿這份 dict 本身當畫面
+    的資料來源**（不是拿 detected_objects 再用位置猜回去對應哪個 vid）——vid、座標、bbox
+    全部照 valid 裡存的值畫，保證跟終端機顯示的是同一批物件、同一個編號，不會有兩邊對不
+    起來的情況。valid 是 None（還沒進互動選取階段，例如剛開始掃描）才退回 detected_objects
+    依偵測清單順序的流水編號，這只是暫時性的、跟終端機無關的顯示。"""
+    def draw_tracked_overlay(self, cv_image, detected_objects, detected_tomatoes, valid=None):
         GREEN, RED = (0, 255, 0), (0, 0, 255)
         font = cv2.FONT_HERSHEY_SIMPLEX
 
-        for idx, obj in enumerate(detected_objects):
-            if obj.get('paired_tomato') is None:
-                continue  # 沒配對到番茄的果梗不畫，避免讓人誤以為可以選
+        stem_labels = {}   # id(obj) -> 畫面上要顯示的編號字串，供番茄那邊對照用
+
+        if valid is not None:
+            source = [(str(vid), entry[0]) for vid, entry in valid.items()]
+        else:
+            source = [(str(idx), obj) for idx, obj in enumerate(detected_objects)
+                      if obj.get('paired_tomato') is not None]  # 沒配對到番茄的果梗不畫
+
+        for label, obj in source:
+            stem_labels[id(obj)] = label
             b = obj['bbox']
             ok, _, _ = TargetSelector.check_candidate(obj, MAX_REACH_M)
             color = GREEN if ok else RED
             cv2.rectangle(cv_image, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), color, 2)
-            cv2.circle(cv_image, (obj['cx'], obj['cy']), 6, color, -1)
-            cv2.putText(cv_image, f"S{idx}", (int(b[0]), int(b[1]) - 6), font, 0.6, color, 2, cv2.LINE_AA)
+            cv2.circle(cv_image, (int(obj['cx']), int(obj['cy'])), 6, color, -1)
+            cv2.putText(cv_image, f"ID{label}", (int(b[0]), int(b[1]) - 6), font, 0.6, color, 2, cv2.LINE_AA)
 
-        # 番茄標籤用「配對到的果梗編號」，讓同一對果梗/番茄的 S/T 數字一致方便對照；
-        # 沒配對到的番茄才用自己在偵測清單裡的編號。
-        # ★ obj['paired_tomato'] 在 vision_node.py 呼叫 StemTracker.update() 後，已經
-        # 經過 TargetSelector.resolve_live_pairing() 重新指向這一幀 detected_tomatoes
-        # 裡的同一個物件，這裡才能單純用 id() 比對——不能省略 resolve_live_pairing()，
-        # 否則這裡的 nt 可能是舊幀留存的物件快照，跟 detected_tomatoes 對不上。
-        tomato_label_num = {}
-        for stem_idx, obj in enumerate(detected_objects):
-            nt = obj.get('paired_tomato')
-            if nt is not None:
-                tomato_label_num[id(nt)] = stem_idx
+        if valid is not None:
+            # valid 裡的 target 是最近一次 refresh_valid 留存的快照（可能是幾百毫秒前），
+            # 跟這一幀的 detected_tomatoes 不是同一批物件、id() 對不起來——直接用每個
+            # target 自己存的 paired_tomato 快照畫，不要拿去跟 detected_tomatoes 比對。
+            for label, obj in source:
+                nt = obj.get('paired_tomato')
+                if nt is None:
+                    continue
+                pickable = not nt.get('occluded', False)
+                color = GREEN if pickable else RED
+                tb = nt['bbox']
+                cv2.rectangle(cv_image, (int(tb[0]), int(tb[1])), (int(tb[2]), int(tb[3])), color, 2)
+                cv2.circle(cv_image, (int(nt['cx']), int(nt['cy'])), 5, color, -1)
+                cv2.putText(cv_image, f"ID{label}", (int(tb[0]), int(tb[1]) - 6), font, 0.6, color, 2, cv2.LINE_AA)
+        else:
+            # 番茄標籤用「配對到的果梗編號」，讓同一對果梗/番茄的 S/T 數字一致方便對照；
+            # ★ obj['paired_tomato'] 在 vision_node.py 呼叫 StemTracker.update() 後，已經
+            # 經過 TargetSelector.resolve_live_pairing() 重新指向這一幀 detected_tomatoes
+            # 裡的同一個物件，這裡才能單純用 id() 比對——這個分支跟上面的 stem_labels
+            # 都是同一幀的 detected_objects/detected_tomatoes，id() 比對才會準。
+            tomato_label_num = {}
+            for obj in detected_objects:
+                nt = obj.get('paired_tomato')
+                if nt is not None and id(obj) in stem_labels:
+                    tomato_label_num[id(nt)] = stem_labels[id(obj)]
 
-        for idx, t in enumerate(detected_tomatoes):
-            if id(t) not in tomato_label_num:
-                continue  # 沒配對到果梗的番茄不畫，避免讓人誤以為可以選
-            pickable = not t.get('occluded', False)
-            color = GREEN if pickable else RED
-            tb = t['bbox']
-            label_num = tomato_label_num[id(t)]
-            cv2.rectangle(cv_image, (int(tb[0]), int(tb[1])), (int(tb[2]), int(tb[3])), color, 2)
-            cv2.circle(cv_image, (t['cx'], t['cy']), 5, color, -1)
-            cv2.putText(cv_image, f"T{label_num}", (int(tb[0]), int(tb[1]) - 6), font, 0.6, color, 2, cv2.LINE_AA)
+            for t in detected_tomatoes:
+                if id(t) not in tomato_label_num:
+                    continue  # 沒配對到果梗（或果梗沒被畫出來）的番茄不畫，避免讓人誤以為可以選
+                pickable = not t.get('occluded', False)
+                color = GREEN if pickable else RED
+                tb = t['bbox']
+                label_num = tomato_label_num[id(t)]
+                cv2.rectangle(cv_image, (int(tb[0]), int(tb[1])), (int(tb[2]), int(tb[3])), color, 2)
+                cv2.circle(cv_image, (t['cx'], t['cy']), 5, color, -1)
+                cv2.putText(cv_image, f"ID{label_num}", (int(tb[0]), int(tb[1]) - 6), font, 0.6, color, 2, cv2.LINE_AA)
 
-        self.draw_info_panel(cv_image, detected_objects, detected_tomatoes)
+        self.draw_info_panel(cv_image, source, detected_tomatoes)
 
     """分別判斷 aspect_ratio、solidity 是否超出 occlusion.py 判定遮擋的門檻（跟
     OcclusionChecker.judge_occlusion 同一組門檻，維持顯示跟實際判斷一致），各自
@@ -69,12 +96,15 @@ class Visualizer:
 
     """在畫面左上角疊加半透明面板，列出每個果梗與配對番茄的世界座標、番茄的形狀指標
     （精簡版面）。每行可以有自己的顏色（YELLOW=標題，WHITE=座標，RED/GREEN=形狀指標
-    是否超過 occlusion 判定門檻），用 (text, color) tuple 取代原本整行統一上色。"""
+    是否超過 occlusion 判定門檻），用 (text, color) tuple 取代原本整行統一上色。
+    ★ stems 是 [(label, obj), ...]（跟 draw_tracked_overlay 的 source 同一份，label 是
+    畫在框上的那個編號字串），不是單純的物件清單——這樣面板列出來的編號才會跟畫面上
+    的框、跟終端機的 ID 三邊一致。"""
     def draw_info_panel(self, img, stems, tomatoes):
         WHITE, YELLOW, RED, GREEN = (255, 255, 255), (0, 255, 255), (0, 0, 255), (0, 255, 0)
         lines = [(f"{len(stems)} stems / {len(tomatoes)} tomatoes", YELLOW)]
-        for idx, obj in enumerate(stems):
-            lines.append((f"[{idx}]S X={obj['world_x']:.3f} Y={obj['world_y']:.3f} Z={obj['world_z']:.3f} D={obj['z_real']:.3f}", WHITE))
+        for label, obj in stems:
+            lines.append((f"[ID{label}] X={obj['world_x']:.3f} Y={obj['world_y']:.3f} Z={obj['world_z']:.3f} D={obj['z_center']:.3f}", WHITE))
             nt = obj.get('paired_tomato')
             if nt is not None:
                 lines.append((f"   T X={nt['world_x']:.3f} Y={nt['world_y']:.3f} Z={nt['world_z']:.3f} D={nt.get('depth', 0.0):.3f}", WHITE))

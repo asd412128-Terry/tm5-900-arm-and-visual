@@ -78,13 +78,13 @@ DEPTH_TOPIC = _CAMERA_TOPICS_BY_MODE[VISION_MODE]['depth']
 CAMERA_INFO_TOPIC = _CAMERA_TOPICS_BY_MODE[VISION_MODE]['camera_info']
 
 # --- YOLO 推論參數 ----------------------------------------------------------
-YOLO_IMGSZ = 1024
+YOLO_IMGSZ = 640
 YOLO_CONF = 0.75
 YOLO_IOU = 0.45                      # NMS IoU 門檻，沿用 test_occlusion.py 調過的值（原本沒接進主流程，
 
 
 # --- 顯示視窗 ----------------------------------------------------------
-DISPLAY_SCALE = 1.0                  # cv2.imshow 顯示視窗的放大倍率，不影響偵測/座標計算
+DISPLAY_SCALE = 1.5                  # cv2.imshow 顯示視窗的放大倍率，不影響偵測/座標計算
 
 # --- 座標系名稱 --------------------------------------------------------------
 WORLD_FRAME = 'world'
@@ -100,10 +100,9 @@ DEPTH_MM_THRESHOLD = 10.0            # 深度值大於這個數字視為單位�
 MIN_VALID_DEPTH_M = 0.01             # 深度小於這個值視為無效
 
 # --- 番茄遮擋判斷 (搬自 test_occlusion.py，門檻沿用同一組) -------------------------
-#ASPECT_RATIO_LOW = 0.9               # isaac_bbox 長寬比下限
-ASPECT_RATIO_HIGH = 1.5              # isaac_bbox 長寬比上限
-ASPECT_RATIO_LOW = 0.9                # real_bbox 長寬比下限
-#ASPECT_RATIO_HIGH = 1.3               # real_bbox 長寬比上限
+ASPECT_RATIO_LOW = 0.9               # real & isaac_bbox 長寬比下限
+ASPECT_RATIO_HIGH = 1.5              # real_bbox 長寬比上限
+#ASPECT_RATIO_HIGH = 1.3             # real_bbox 長寬比上限
 SOLIDITY_THRESH = 0.9               # mask 面積 / 擬合橢圓面積，低於這個判定形狀跟橢圓差太多
 
 # --- 果梗骨架化 / 抓取點 -----------------------------------------------------
@@ -112,10 +111,20 @@ SOLIDITY_THRESH = 0.9               # mask 面積 / 擬合橢圓面積，低於�
 #          2cm 以內)的情境，用固定物理距離很容易逼近甚至超過整根果梗長度。
 # 'distance'：固定物理距離 GRASP_TARGET_DIST_M，太短量不到才退回比例保底；適合果梗
 #          長度差異大、且長果梗夠長時的情境。目前實測這批果梗普遍偏短，先用 'ratio'。
-GRASP_METHOD = 'ratio'
+GRASP_METHOD = 'distance'
 GRASP_RATIO_MIN = 0.4
 GRASP_RATIO_MAX = 0.5
 GRASP_TARGET_DIST_M = 0.015           # 只有 GRASP_METHOD='distance' 時才用，抓取點目標離calyx的實際距離(m)
+
+# GRASP_METHOD='distance' 時，怎麼找那個目標距離的點（只有這個模式才會讀）：
+# 'accumulate'：沿骨架逐點量深度、反投影成 3D 座標，相鄰點累加真實弧長，找到累加至
+#               GRASP_TARGET_DIST_M 的點——不管果梗彎不彎都精確，但要逐點量深度，
+#               運算量較大（有做提前停止優化，見 coordinates.py find_grasp_point_by_3d_distance）。
+# 'chord_ratio'：只量頭尾兩個端點的深度，用端點 3D 直線距離(弦長)算比例、乘上路徑總
+#               點數直接定位——只要量 2 個點，快很多，但把骨架路徑當直線處理：果梗
+#               彎曲時弦長 < 實際弧長，算出來的抓取點會比正確位置更靠近枝條端（系統性
+#               誤差隨彎曲程度增加，果梗越直越短誤差越小）。
+GRASP_DISTANCE_MODE = 'accumulate'
 OVERLAP_SUPPRESS_THRESH = 0.5        # 果梗 mask 互相重疊比例超過此值視為重複偵測
 
 # --- StemTracker 滑動視窗 ------------------------------------------------
@@ -144,6 +153,11 @@ OCCLUDED_SCAN_GRACE = 3              # 連續幾輪候選都判定「全部遮�
 SCAN_PRINT_INTERVAL = 1.5            # 終端機列印候選清單的節流間隔 (s)
 MAX_REACH_M = 1.5                    # 距離基座超過此值的候選直接排除
 CANDIDATE_REFRESH_INTERVAL_SEC = 1.0 # 等待使用者輸入 ID 期間，即時面板重繪的節流間隔 (s)
+# refresh_valid() 判定候選「消失或移動過大」原本單幀沒配到就立刻標失效——單幀深度雜訊
+# (2026-09-09 實測：同一像素、同一 grasp_idx，深度相機讀出來的 3D 座標還是會跳，見
+# PROGRESS.md) 或 YOLO 單幀漏偵測都會誤觸發，讓即時面板一直閃「已失效」。連續失敗超過
+# 這個次數才真的判失效，容忍偶發的單幀壞讀值。
+REFRESH_VALID_MAX_MISS = 2
 
 # --- 點雲閘門 / 目標過濾 -----------------------------------------------
 # ★ 原本這個 gate + 轉發是寫在手臂端 (arm_car_vector_z.py) 的 TM5MTaskNode，
