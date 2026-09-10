@@ -19,7 +19,7 @@ ARM_MODE = os.environ.get('ARM_MODE', 'real').strip().lower()
 if ARM_MODE not in ('real', 'isaac'):
     ARM_MODE = 'isaac'
 
-MODE = 'lab'   # 'car' 或 'lab' ← 只改這一行切換環境
+MODE = 'car'   # 'car' 或 'lab' ← 只改這一行切換環境
 
 
 # ===========================================================================
@@ -79,8 +79,8 @@ PLANNER_ID   = 'RRTstarkConfigDefault'
 ARM_JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 
 # --- 夾爪幾何與開合量 -------------------------------------------------------
-#GRIPPER_LENGTH  = 0.16      # isaac_法蘭面到夾爪咬合中心的距離 (m)
-GRIPPER_LENGTH  = 0.17      # real_法蘭面到夾爪咬合中心的距離 (m)
+GRIPPER_LENGTH  = 0.16      # isaac_法蘭面到夾爪咬合中心的距離 (m)
+#GRIPPER_LENGTH  = 0.17      # real_法蘭面到夾爪咬合中心的距離 (m)
 APPROACH_DIST   = 0.10      # 預備點 A 沿接近軸再往後退多少 (m)
 
 GRIPPER_PREOPEN = 0.010     # 出發前先張開
@@ -139,7 +139,6 @@ COARSE_TO_FINE_RETREAT_M = 0.30
 # MathUtils.orbit_around_target。跟舊版「只轉 joint_1、其他關節不變」的差別是：
 # 舊版繞的是基座轉軸，準心不保證還對著同一顆番茄；這版繞的是目標點本身，準心
 # 保證還對著同一個點。
-ENABLE_ALT_VIEW = True   # False = 全部候選被遮擋時直接回初始位置，不切換備用視角重掃
 ALT_VIEW_AZIMUTH_OFFSETS_DEG = [30.0, -30.0]
 
 # 點雲轉發 / 過濾已搬到視覺端 (vision_node)，本模組不再直接碰點雲。
@@ -149,7 +148,7 @@ JOINT_VEL, JOINT_ACC = 0.2, 0.2    # 關節空間移動
 POSE_VEL,  POSE_ACC  = 0.2, 0.2    # OMPL 位姿移動
 CART_VEL,  CART_ACC  = 0.15, 0.15    # 笛卡爾直線
 
-PLAN_TIME_JOINT = 3.0
+PLAN_TIME_JOINT = 1.5
 PLAN_TIME_POSE  = 5.0
 PLAN_ATTEMPTS   = 15
 
@@ -178,6 +177,7 @@ J6_TOLERANCE = math.radians(90.0)
 # --- 任務流程 ----------------------------------------------------------------
 GO_TO_BASKET        = False   # True = 夾完先去籃子放；False = 直接回 Home
 RETURN_HOME_MAX_RETRIES = 3   # 任何一步失敗後，退回初始姿態最多重試幾次才放棄、轉 IDLE 請人工檢查
+ENABLE_ALT_VIEW = True   # False = 全部候選被遮擋時直接回初始位置，不切換備用視角重掃
 PAUSE_AT_APPROACH   = 1.0     # 抵達點 A 後停頓 (s)
 PAUSE_AFTER_GRASP   = 1.5     # 夾緊後停頓
 PAUSE_AFTER_RELEASE = 1.0     # 放開後停頓
