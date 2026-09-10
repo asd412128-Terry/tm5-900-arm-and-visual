@@ -78,13 +78,13 @@ DEPTH_TOPIC = _CAMERA_TOPICS_BY_MODE[VISION_MODE]['depth']
 CAMERA_INFO_TOPIC = _CAMERA_TOPICS_BY_MODE[VISION_MODE]['camera_info']
 
 # --- YOLO 推論參數 ----------------------------------------------------------
-YOLO_IMGSZ = 640
+YOLO_IMGSZ = 1024
 YOLO_CONF = 0.75
 YOLO_IOU = 0.45                      # NMS IoU 門檻，沿用 test_occlusion.py 調過的值（原本沒接進主流程，
 
 
 # --- 顯示視窗 ----------------------------------------------------------
-DISPLAY_SCALE = 1.5                  # cv2.imshow 顯示視窗的放大倍率，不影響偵測/座標計算
+DISPLAY_SCALE = 1.0                  # cv2.imshow 顯示視窗的放大倍率，不影響偵測/座標計算
 
 # --- 座標系名稱 --------------------------------------------------------------
 WORLD_FRAME = 'world'
@@ -111,7 +111,7 @@ SOLIDITY_THRESH = 0.9               # mask 面積 / 擬合橢圓面積，低於�
 #          2cm 以內)的情境，用固定物理距離很容易逼近甚至超過整根果梗長度。
 # 'distance'：固定物理距離 GRASP_TARGET_DIST_M，太短量不到才退回比例保底；適合果梗
 #          長度差異大、且長果梗夠長時的情境。目前實測這批果梗普遍偏短，先用 'ratio'。
-GRASP_METHOD = 'distance'
+GRASP_METHOD = 'ratio'
 GRASP_RATIO_MIN = 0.4
 GRASP_RATIO_MAX = 0.5
 GRASP_TARGET_DIST_M = 0.015           # 只有 GRASP_METHOD='distance' 時才用，抓取點目標離calyx的實際距離(m)
