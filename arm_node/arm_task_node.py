@@ -97,7 +97,7 @@ class TM5MTaskNode(Node):
 
         if msg.data == 'OCCLUDED':
             self.scanning = False
-            if self._alt_pose_idx < len(config.ALT_VIEW_AZIMUTH_OFFSETS_DEG):
+            if config.ENABLE_ALT_VIEW and self._alt_pose_idx < len(config.ALT_VIEW_AZIMUTH_OFFSETS_DEG):
                 azimuth_offset_deg = config.ALT_VIEW_AZIMUTH_OFFSETS_DEG[self._alt_pose_idx]
                 self._alt_pose_idx += 1
                 self.get_logger().info(

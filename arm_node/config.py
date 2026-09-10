@@ -19,7 +19,7 @@ ARM_MODE = os.environ.get('ARM_MODE', 'real').strip().lower()
 if ARM_MODE not in ('real', 'isaac'):
     ARM_MODE = 'isaac'
 
-MODE = 'car'   # 'car' 或 'lab' ← 只改這一行切換環境
+MODE = 'lab'   # 'car' 或 'lab' ← 只改這一行切換環境
 
 
 # ===========================================================================
@@ -79,8 +79,8 @@ PLANNER_ID   = 'RRTstarkConfigDefault'
 ARM_JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 
 # --- 夾爪幾何與開合量 -------------------------------------------------------
-GRIPPER_LENGTH  = 0.16      # isaac_法蘭面到夾爪咬合中心的距離 (m)
-#GRIPPER_LENGTH  = 0.17      # real_法蘭面到夾爪咬合中心的距離 (m)
+#GRIPPER_LENGTH  = 0.16      # isaac_法蘭面到夾爪咬合中心的距離 (m)
+GRIPPER_LENGTH  = 0.17      # real_法蘭面到夾爪咬合中心的距離 (m)
 APPROACH_DIST   = 0.10      # 預備點 A 沿接近軸再往後退多少 (m)
 
 GRIPPER_PREOPEN = 0.010     # 出發前先張開
@@ -139,6 +139,7 @@ COARSE_TO_FINE_RETREAT_M = 0.30
 # MathUtils.orbit_around_target。跟舊版「只轉 joint_1、其他關節不變」的差別是：
 # 舊版繞的是基座轉軸，準心不保證還對著同一顆番茄；這版繞的是目標點本身，準心
 # 保證還對著同一個點。
+ENABLE_ALT_VIEW = True   # False = 全部候選被遮擋時直接回初始位置，不切換備用視角重掃
 ALT_VIEW_AZIMUTH_OFFSETS_DEG = [30.0, -30.0]
 
 # 點雲轉發 / 過濾已搬到視覺端 (vision_node)，本模組不再直接碰點雲。
@@ -165,6 +166,14 @@ J1_TOLERANCE  = math.radians(40.0)  # J1 面對目標的彈性範圍
 # 硬體限位是 ±155 度，容差再大也會被限位收斂，實測後再依實際效果調整。
 ELBOW_UP_CENTER    = math.radians(90.0)
 ELBOW_UP_TOLERANCE = math.radians(90.0)
+
+# joint_6（腕部滾轉）約束：J6 硬體限位 ±270 度，同一個末端姿態在角度上每隔 360 度
+# 就有一個等效解，容差沒鎖住的話 OMPL 可能選到「多轉一整圈」才能到的那個等效解
+# （例如選到 +170 度而不是 -190 度以外的等效角）。鎖在 POSE_HOME/FINE/BASKET_DEG
+# 現有姿態都採用的 0 度附近，容差抓 ±90 度，比涵蓋所有等效解所需的 ±180 度更緊，
+# 排除掉需要多轉一圈才能到的那個分支，防止腕部整個轉一圈。
+J6_CENTER    = math.radians(0.0)
+J6_TOLERANCE = math.radians(90.0)
 
 # --- 任務流程 ----------------------------------------------------------------
 GO_TO_BASKET        = False   # True = 夾完先去籃子放；False = 直接回 Home

@@ -254,5 +254,10 @@ class TM5MController:
         jc3.tolerance_above = jc3.tolerance_below = config.ELBOW_UP_TOLERANCE
         gc.joint_constraints.append(jc3)
 
+        # (e) J6 約束：鎖在 0 度附近 ±180 度，避免 OMPL 選到要多轉一整圈才能到的等效解
+        jc6 = JointConstraint(joint_name='joint_6', position=config.J6_CENTER, weight=1.0)
+        jc6.tolerance_above = jc6.tolerance_below = config.J6_TOLERANCE
+        gc.joint_constraints.append(jc6)
+
         req.goal_constraints.append(gc)
         return goal_msg
