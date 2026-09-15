@@ -19,7 +19,7 @@ if VISION_MODE not in ('real', 'isaac'):
     VISION_MODE = 'isaac'
 
 _MODEL_PATH_BY_MODE = {
-    'real':  '/home/lab604/tm_ws/python_real/best.pt',
+    'real':  '/home/lab604/tm_ws/python_real/yolo_model/1024/best.pt',
     'isaac': '/home/terry/Desktop/stem_isaac_train/runs/segment/tomato_stem/exp6/weights/best.pt',
 }
 _CAMERA_TOPICS_BY_MODE = {
@@ -101,8 +101,8 @@ MIN_VALID_DEPTH_M = 0.01             # 深度小於這個值視為無效
 
 # --- 番茄遮擋判斷 (搬自 test_occlusion.py，門檻沿用同一組) -------------------------
 ASPECT_RATIO_LOW = 0.9               # real & isaac_bbox 長寬比下限
-ASPECT_RATIO_HIGH = 1.5              # real_bbox 長寬比上限
-#ASPECT_RATIO_HIGH = 1.3             # real_bbox 長寬比上限
+#ASPECT_RATIO_HIGH = 1.5              # real_bbox 長寬比上限
+ASPECT_RATIO_HIGH = 1.3             # real_bbox 長寬比上限
 SOLIDITY_THRESH = 0.9               # mask 面積 / 擬合橢圓面積，低於這個判定形狀跟橢圓差太多
 
 # --- 果梗骨架化 / 抓取點 -----------------------------------------------------
@@ -111,7 +111,7 @@ SOLIDITY_THRESH = 0.9               # mask 面積 / 擬合橢圓面積，低於�
 #          2cm 以內)的情境，用固定物理距離很容易逼近甚至超過整根果梗長度。
 # 'distance'：固定物理距離 GRASP_TARGET_DIST_M，太短量不到才退回比例保底；適合果梗
 #          長度差異大、且長果梗夠長時的情境。目前實測這批果梗普遍偏短，先用 'ratio'。
-GRASP_METHOD = 'ratio'
+GRASP_METHOD = 'distance'
 GRASP_RATIO_MIN = 0.4
 GRASP_RATIO_MAX = 0.5
 GRASP_TARGET_DIST_M = 0.015           # 只有 GRASP_METHOD='distance' 時才用，抓取點目標離calyx的實際距離(m)
@@ -129,7 +129,7 @@ OVERLAP_SUPPRESS_THRESH = 0.5        # 果梗 mask 互相重疊比例超過此�
 
 # --- StemTracker 滑動視窗 ------------------------------------------------
 STEM_MATCH_DIST_PX = 40.0            # 前後幀配對同一根果梗的最大像素距離
-STEM_TRACK_WINDOW = 7                # 滑動視窗長度 (幀數)
+STEM_TRACK_WINDOW = 15                # 滑動視窗長度 (幀數)
 STEM_TRACK_MAX_MISS = 5              # 連續幾幀沒配對到就判定 track 消失
 
 # --- 配對 / 遮擋 時間穩定 (修紅綠燈閃爍) -------------------------------------
@@ -141,6 +141,11 @@ STEM_TRACK_MAX_MISS = 5              # 連續幾幀沒配對到就判定 track �
 PAIR_STICKY_MATCH_DIST_M = 0.03      # 判定「前一幀同一根果梗/同一顆番茄」的最大位移容忍(公尺)
 PAIR_STICKY_DISCOUNT = 0.7           # 前一幀配對過的番茄，距離打這個折扣再排序，
                                       # 避免在幾乎等距的候選番茄之間，因量測雜訊每幀跳配
+MAX_STEM_TOMATO_PAIR_DIST_M = 0.05   # 實測校準過的值：關掉門檻(inf)測試時量到正確配對
+                                      # ~0.041m、錯誤硬湊的配對 ~0.54~0.58m，取中間值。
+                                      # 果梗端點(果實端)到番茄中心點的距離上限(公尺)，
+                                      # 超過就算是目前最近的候選也不配對，避免孤立果梗
+                                      # 硬配一顆明顯不是它的番茄
 TOMATO_MATCH_DIST_M = 0.03           # 番茄前後幀配對容忍距離(公尺)，用於穩定遮擋判斷
 TOMATO_OCC_CONFIRM_FRAMES = 3        # 遮擋判定要連續幾幀改變才真的切換，單幀雜訊不算數
 TOMATO_TRACK_MAX_MISS = 5            # 番茄追蹤連續幾幀沒配對到就視為消失，清掉暫存狀態
@@ -166,5 +171,9 @@ REFRESH_VALID_MAX_MISS = 2
 # ★ 掃描期間刻意不轉發點雲，OctoMap 保持空白（呼應 _enter_scanning 的全域清空），
 #   直到選定目標的那一刻，才發布目標遮罩，交給獨立的 cloud_filter_node.py 一次性建圖。
 TARGET_MASK_DILATE_PX = 15           # 目標番茄 mask 膨脹核心大小 (px)，先給保守值，實測後再調
-STEM_MASK_DILATE_PX = 9              # 目標果梗 mask 膨脹核心大小 (px)，果梗較細先給比番茄小的值，實測後再調
-OCTOMAP_UPDATE_WAIT_SEC = 1.5        # 發布過濾點雲後，等 MoveIt2 的 octomap updater 處理完再繼續
+STEM_MASK_DILATE_PX = 31             # 目標果梗 mask 膨脹核心大小 (px)，2026-09-15：cv2.dilate 實際擴張約 N/2，9→15 只多擴張 3px 沒感覺，跳大做決定性測試（實際擴張約 15px）
+OCTOMAP_UPDATE_WAIT_SEC = 2.5        # 發布過濾點雲後，等 cloud_filter_node.py 完成訊號的逾時保底；
+                                      # 2026-09-15 改版：cloud_filter_node.py 正常路徑一等到 TF 就緒
+                                      # （通常一兩幀內）就馬上發訊號，不用再等固定時間；這裡的 2.5s
+                                      # 只是保底，要大於它自己的 TF_WAIT_TIMEOUT_SEC（2.0s）逾時保底，
+                                      # 否則對方都還沒判定逾時、這邊就先自己放棄等待了

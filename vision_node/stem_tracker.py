@@ -5,6 +5,7 @@
 """
 
 import math
+import statistics
 import time
 from collections import deque
 from .config import STEM_MATCH_DIST_PX, STEM_TRACK_WINDOW, STEM_TRACK_MAX_MISS
@@ -40,27 +41,31 @@ class StemTracker:
     world_x/y/z、vx/vy/vz」，本質上是在平均兩個可能天差地遠的最終結果，算出來的東西
     physically 可能兩個都不是。改成平滑**源頭**：番茄中心、骨架兩端點(tip/root)、
     抓取點、算向量用的 calyx/branch 兩簇，總共 6 個點，每個點各自(px,py,z)這組
-    『像素座標+相機座標系深度』先在視窗內平均，最後才反投影一次算 world_x/y/z、
+    『像素座標+相機座標系深度』先在視窗內取中位數，最後才反投影一次算 world_x/y/z、
     vx/vy/vz（見 vision_node.py 呼叫 update() 之後那段，跟 CoordinateEstimator.
     pixel_depth_pair_to_unit_vector 共用同一套換算）。這裡回傳的 rec 裡
     world_x/y/z、vx/vy/vz 仍是『這一幀』的原始值（沒有意義，等著被覆寫），呼叫端
     務必在讀這兩組之前先做完反投影，不能直接用。"""
-    # ★ 任何一幀是 NaN，sum() 整包會變 NaN、污染整個視窗的平均值（要等那幀被踢出視窗
-    # 才會恢復）——跳過 NaN，只平均還有效的幀；全部都是 NaN 才回傳 default。
+    # ★ 用中位數而非平均數：雙模態雜訊（讀數在兩個叢集間跳）取平均會算出兩叢集中間
+    # 一個誰都不是的假值，取中位數則保證回傳視窗裡『真的量到過』的某一幀數值，
+    # 落在人數較多那個叢集上，不會發明出一個不存在的中間值。median_low 而非
+    # median：statistics.median 遇到偶數筆數會取中間兩筆的平均，一樣可能落在
+    # 兩叢集之間；median_low 固定回傳中間偏低那一筆實際樣本，才符合「一定是某一幀
+    # 真實量測」這個要求。跳過 NaN，只用還有效的幀；全部都是 NaN 才回傳 default。
     @staticmethod
-    def _safe_mean(history: deque, key: str, default: float) -> float:
+    def _safe_median(history: deque, key: str, default: float) -> float:
         vals = [v for v in (d.get(key, default) for d in history) if math.isfinite(v)]
-        return sum(vals) / len(vals) if vals else default
+        return statistics.median_low(vals) if vals else default
 
     # 平滑「一個點」的 (px, py, z) 三個分量，原地寫回 rec；6 個點都呼叫這同一個 def，
-    # 不要 6 組各自複製一份平均邏輯。default 是這個點量不到時的退回值（通常是抓取點）。
+    # 不要 6 組各自複製一份中位數邏輯。default 是這個點量不到時的退回值（通常是抓取點）。
     @classmethod
     def _smooth_point(cls, rec: dict, history: deque, best: dict,
                        px_key: str, py_key: str, z_key: str,
                        default_px: float, default_py: float, default_z: float):
-        rec[px_key] = cls._safe_mean(history, px_key, best.get(px_key, default_px))
-        rec[py_key] = cls._safe_mean(history, py_key, best.get(py_key, default_py))
-        rec[z_key] = cls._safe_mean(history, z_key, best.get(z_key, default_z))
+        rec[px_key] = cls._safe_median(history, px_key, best.get(px_key, default_px))
+        rec[py_key] = cls._safe_median(history, py_key, best.get(py_key, default_py))
+        rec[z_key] = cls._safe_median(history, z_key, best.get(z_key, default_z))
 
     @classmethod
     def _smoothed_record(cls, history: deque) -> dict:

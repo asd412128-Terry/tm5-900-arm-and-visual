@@ -127,15 +127,16 @@ class Visualizer:
             cv2.putText(img, ln, (x0 + pad, y), font, scale, color, thick, cv2.LINE_AA)
             y += line_h
 
-    """終端機列印本輪掃描到的果梗/番茄清單。"""
-    def print_scan_summary(self, detected_objects, tomatoes):
+    """終端機列印本輪掃描到的果梗/番茄清單。valid/invalid_reasons 跟畫面用同一份
+    build_valid_candidates 的產物（見 vision_node.py 的 _pending_valid 說明），編號/格式
+    直接沿用 TargetSelector._format_candidate_lines，保證終端機跟畫面上的 ID 一致——
+    沒配對到番茄、超出範圍等原因被排除的果梗不在這份編號清單裡（build_valid_candidates
+    呼叫當下已經另外印過「不能夾的」原因清單），detected_objects 的總數只用來讓標題行
+    反映『這一幀實際偵測到幾根果梗』，跟 valid 的編號數量可能不同。"""
+    def print_scan_summary(self, detected_objects, tomatoes, valid, invalid_reasons):
         print("\n" + "=" * 60)
-        print(f"偵測到 {len(detected_objects)} 個果梗 / {len(tomatoes)} 個番茄")
+        print(f"偵測到 {len(detected_objects)} 個果梗 / {len(tomatoes)} 個番茄（可選候選 {len(valid)} 個，編號跟畫面一致）")
         print("-" * 60)
-        for idx, obj in enumerate(detected_objects):
-            print(f"  [ID:{idx}] Stem X={obj['world_x']:.3f}, Y={obj['world_y']:.3f}, Z={obj['world_z']:.3f} "
-                  f"| Vec:[{obj.get('vx', 0):.2f}, {obj.get('vy', 0):.2f}, {obj.get('vz', -1):.2f}]")
-            nearest = obj.get('paired_tomato')
-            if nearest is not None:
-                print(f"         Tomato X={nearest['world_x']:.3f}, Y={nearest['world_y']:.3f}, Z={nearest['world_z']:.3f}")
+        for line in TargetSelector._format_candidate_lines(valid, invalid_reasons):
+            print(line)
         print("=" * 60)

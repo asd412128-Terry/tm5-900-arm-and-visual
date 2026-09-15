@@ -15,8 +15,8 @@ import sys
 import termios
 import time
 import unicodedata
-from .config import (CANDIDATE_REFRESH_INTERVAL_SEC, MAX_REACH_M, PAIR_STICKY_DISCOUNT,
-                      PAIR_STICKY_MATCH_DIST_M, REFRESH_VALID_MAX_MISS)
+from .config import (CANDIDATE_REFRESH_INTERVAL_SEC, MAX_REACH_M, MAX_STEM_TOMATO_PAIR_DIST_M,
+                      PAIR_STICKY_DISCOUNT, PAIR_STICKY_MATCH_DIST_M, REFRESH_VALID_MAX_MISS)
 
 
 """中文等全形字元在終端機上佔 2 個字元寬，照 len() 算行寬會低估，導致遊標上移
@@ -44,7 +44,9 @@ class TargetSelector:
     拿果梗兩個骨架端點 (end0_world/end1_world) 分別去跟每顆番茄的中心 (world_x/y/z)
     算 3D 世界座標距離，列出「(某端點, 某顆番茄)」的所有組合、由近到遠排序，依序
     貪婪配對——一顆番茄配走了就不能再被搶走，一根果梗也只會用其中一端配走一次；
-    配對贏的那一端，就是果實端，不用再另外比較兩端誰近。
+    配對贏的那一端，就是果實端，不用再另外比較兩端誰近。距離超過
+    MAX_STEM_TOMATO_PAIR_DIST_M 的組合直接不列入候選，就算是全域最近的一組也一樣
+    ——避免找不到真正配對番茄的孤立果梗，被硬配一顆明顯太遠的番茄。
     （原本用 bbox 頂端點配對，理論上比中心點準，但果實歪斜時頂端點不一定是實際接點，
     改用中心點更穩定。）
     回傳 (pairs, reverse)：
@@ -104,7 +106,10 @@ class TargetSelector:
                 sticky = (sticky_tomato_pos is not None and
                           math.dist(t_pos, sticky_tomato_pos) < PAIR_STICKY_MATCH_DIST_M)
                 for is_end1, ep in ((False, s['end0_world']), (True, s['end1_world'])):
-                    d = math.dist(ep, t_pos)
+                    raw_d = math.dist(ep, t_pos)
+                    if raw_d > MAX_STEM_TOMATO_PAIR_DIST_M:
+                        continue  # 太遠，就算目前最近也不勉強配對，讓這根果梗保持沒配對
+                    d = raw_d
                     if sticky:
                         d *= PAIR_STICKY_DISCOUNT
                     if sticky_is_end1 is not None and is_end1 == sticky_is_end1:
@@ -240,13 +245,18 @@ class TargetSelector:
     是「連續配不到幾次」，用來抓 target_selector.py 這邊比對用的內部索引（沿用上一輪
     的 old vid，不是新編號），重新編號後才搬到新編號下，確保容忍邏輯不會因為重編號
     就跟丟。
-    ★ 「找不到夠近的」這個原因不會單幀立刻判失效：2026-09-09 實測證實，即使
+    ★ 「找不到夠近的」這個原因不會單幀立刻判消失：2026-09-09 實測證實，即使
     grasp_idx/取樣像素完全沒變，深度相機在同一位置讀出來的 3D 座標偶爾還是會跳掉
     （深度感測雜訊，不是演算法問題，細節見 PROGRESS.md）；YOLO 單幀漏偵測也是同一種
-    「這一幀量測不能信、很快就恢復」的情況。超過 REFRESH_VALID_MAX_MISS 才真的判
-    失效，避免面板一直閃。check_candidate 判定不合格（座標異常/超出範圍/沒配對到
+    「這一幀量測不能信、很快就恢復」的情況。超過 REFRESH_VALID_MAX_MISS 才真的判定
+    消失，直接從 new_valid 移除——不是只打個標記留著，物理上已經拿走的目標框不會
+    卡在畫面上一直畫。check_candidate 判定不合格（座標異常/超出範圍/沒配對到
     番茄/被遮擋/向量 NaN）是結構性問題、拿到的是「這一幀真的配對到」的量測，不受
-    這個容忍影響，一律立刻判失效。
+    這個容忍影響，一律立刻判失效（但這種情況目標本身還在，只是暫時不能夾，所以
+    還是留在 new_valid 裡、只標 invalid_reasons，跟「真的消失」分開處理）。
+    ★ latest_targets 裡沒被配走的（不屬於任何既有候選），只要 check_candidate 判定
+    可選或只是暫時遮擋，也會當新候選補進 new_valid——選取途中才重新出現的目標（例如
+    番茄被拿開又放回去）才會自動被抓到，不用使用者按 r 整輪重新掃描才看得到。
     回傳 (new_valid, invalid_reasons)。"""
     @staticmethod
     def refresh_valid(valid: dict, latest_targets: list, max_reach_m: float,
@@ -267,6 +277,7 @@ class TargetSelector:
 
         # 先照舊編號逐一比對更新（沿用原本的比對/容忍邏輯），暫存結果，還不決定新編號
         updated = []   # [(target, vx, vy, vz, distance_to_base, reason_or_None, miss, pos)]
+        matched_target_ids = set()   # latest_targets 裡被配走的 id()，剩下的才可能是新出現的候選
         for old_vid, (target, vx, vy, vz, distance_to_base) in valid.items():
             old_pos = (target['world_x'], target['world_y'], target['world_z'])
             match, match_d = None, max_dist_m
@@ -277,16 +288,34 @@ class TargetSelector:
 
             if match is None:
                 miss = _prev_miss(old_pos) + 1
-                reason = "目標消失或移動過大" if miss > max_miss else None
-                updated.append((target, vx, vy, vz, distance_to_base, reason, miss, old_pos))
+                if miss > max_miss:
+                    continue  # 連續多次配不到，判定真的消失，直接丟掉，不要留著一直畫
+                updated.append((target, vx, vy, vz, distance_to_base, None, miss, old_pos))
                 continue
 
+            matched_target_ids.add(id(match))
             ok, reason, new_distance = TargetSelector.check_candidate(match, max_reach_m)
             new_vx = match.get('vx', 0.0)
             new_vy = match.get('vy', 0.0)
             new_vz = match.get('vz', -1.0)
             new_pos = (match['world_x'], match['world_y'], match['world_z'])
             updated.append((match, new_vx, new_vy, new_vz, new_distance, None if ok else reason, 0, new_pos))
+
+        # ★ 這一輪 latest_targets 裡沒被任何既有候選配走的，可能是選取途中才重新出現的
+        # 目標（例如番茄被拿開又放回去、剛好轉出遮擋）——不補這段的話，這種目標永遠不會
+        # 自動出現在候選清單裡，使用者得按 r 重新整輪掃描才看得到，體驗上像是「沒偵測
+        # 到」。跟 build_valid_candidates 一樣的標準：check_candidate 判定可選、或只是
+        # 暫時被遮擋，才收進來當新候選；其他結構性排除原因（沒配對到番茄/超出範圍/
+        # 向量異常）不列入，這裡沒有終端機可以印原因，靜靜濾掉即可。
+        for t in latest_targets:
+            if id(t) in matched_target_ids:
+                continue
+            ok, reason, distance_to_base_new = TargetSelector.check_candidate(t, max_reach_m)
+            if not ok and not (reason and reason.startswith('配對番茄被判定遮擋')):
+                continue
+            pos = (t['world_x'], t['world_y'], t['world_z'])
+            updated.append((t, t.get('vx', 0.0), t.get('vy', 0.0), t.get('vz', -1.0),
+                             distance_to_base_new, None if ok else reason, 0, pos))
 
         # 依「能不能選、目前深度」重新排序、重新編號：可選的排前面（依深度近到遠），
         # 已失效的一律排最後（同樣依深度近到遠）；miss_counts 改存這一輪每個候選的
@@ -322,12 +351,19 @@ class TargetSelector:
             lines.append(
                 f"  [ID:{vid}] 果梗 深度={target['z_center']:.3f}m | X={target['world_x']:.3f}, "
                 f"Y={target['world_y']:.3f}, Z={target['world_z']:.3f}"
-                f"（距基座 {distance_to_base:.3f} 公尺） | Vector:[{vx:.2f}, {vy:.2f}, {vz:.2f}]{tag}")
+                f"（距基座 {distance_to_base:.3f} 公尺） | Vector:[{vx:.2f}, {vy:.2f}, {vz:.2f}]")
             nt = target.get('paired_tomato')
             if nt is not None:
+                dist = target.get('calyx_tomato_dist')
+                dist_str = f" | 端點-中心距離={dist:.3f}m" if dist is not None else ""
                 lines.append(
                     f"         番茄 深度={nt.get('depth', 0.0):.3f}m | X={nt['world_x']:.3f}, "
-                    f"Y={nt['world_y']:.3f}, Z={nt['world_z']:.3f}")
+                    f"Y={nt['world_y']:.3f}, Z={nt['world_z']:.3f}{dist_str}")
+            # tag（失效/遮擋原因）放在這組配對的最下面，不要夾在果梗跟番茄兩行中間——
+            # 原因是配對整體的狀態，該接在番茄資訊之後，讀起來才是「果梗、番茄、這組怎麼了」
+            # 的順序，不會被誤會成是果梗本身的附註。
+            if tag:
+                lines.append(f"         {tag}")
         return lines
 
     """終端機互動選取目標 ID，等待輸入期間原地即時更新候選座標（不往下滾動畫面）。

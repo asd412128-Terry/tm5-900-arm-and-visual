@@ -127,6 +127,8 @@ class ObjectDetector:
                 for p in prepared:
                     anchor_t = pairs.get(id(p))
                     if anchor_t is None:
+                        self._register_unpaired_stem(p, fx, fy, ux_img, uy_img, trans, depth_img,
+                                                      confs_all, detected_objects, stamp)
                         continue
                     reverse = reverse_map[id(p)]
                     fingerprint = tuple((a + b) / 2.0 for a, b in zip(p['end0_world'], p['end1_world']))
@@ -236,6 +238,47 @@ class ObjectDetector:
             'end0_world': end0_world, 'end1_world': end1_world,
             'end0_px': (end0_x, end0_y), 'end1_px': (end1_x, end1_y),
         }
+
+    """偵測到、但沒配對到番茄的果梗：只登記「這裡有一根果梗」這件事，不猜哪端是果實端、
+    不算抓取點/方向向量——沒有番茄配對就沒有依據判斷方向，猜錯的話會混進 StemTracker
+    的平滑歷史，污染之後（配對成功時）算出來的抓取點/方向（見 _finish_stem_detection
+    開頭那段說明）。深度用整個 mask 的中位數（跟 _process_tomato_detection 算番茄深度
+    同一招，不挑特定像素、不依賴骨架排序），純粹讓這根果梗能出現在偵測清單／終端機
+    列印裡；'paired_tomato' 固定 None，check_candidate 會直接判定「沒有配對到番茄」，
+    不會被誤判成可夾取目標，也不會被 visualizer 畫框（見 visualizer.py 的過濾條件）。
+    偵測（有沒有找到果梗）跟配對（配到哪顆番茄）是兩件事，不該因為配對失敗就讓偵測
+    結果整個消失不見。"""
+    def _register_unpaired_stem(self, prep, fx, fy, ux_img, uy_img, trans, depth_img,
+                                 confs_all, detected_objects, stamp=None):
+        b, i, mask_bin = prep['b'], prep['i'], prep['mask_bin']
+        z = self.coord.median_depth_in_mask(depth_img, mask_bin, 1)
+        if z is None:
+            return
+        z = self.coord.to_meters(z)
+        if z <= MIN_VALID_DEPTH_M:
+            return
+
+        cx_pixel = int((b[0] + b[2]) / 2)
+        cy_pixel = int((b[1] + b[3]) / 2)
+        local_point = self.coord.backproject_to_local_point(cx_pixel, cy_pixel, z, fx, fy, ux_img, uy_img,
+                                                              stamp=stamp)
+        world_point = tf2_geometry_msgs.do_transform_point(local_point, trans)
+        if not all(math.isfinite(v) for v in (world_point.point.x, world_point.point.y, world_point.point.z)):
+            return
+
+        detected_objects.append({
+            'bbox': b,
+            'cx': cx_pixel, 'cy': cy_pixel,
+            'z_real': z, 'z_center': z,
+            'world_x': world_point.point.x,
+            'world_y': world_point.point.y,
+            'world_z': world_point.point.z,
+            'end0_px': prep['end0_px'],
+            'end1_px': prep['end1_px'],
+            'conf': float(confs_all[i]),
+            'mask': mask_bin,
+            'paired_tomato': None,
+        })
 
     """第二階段：配對階段已經決定好哪端是果實端(calyx)（reverse=True 代表 end1 是），
     這裡只管正式算抓取點、3D 方向向量與世界座標，寫進 detected_objects。

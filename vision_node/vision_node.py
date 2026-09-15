@@ -28,7 +28,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformException, TransformListener
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from .config import (ARM_FLANGE_FRAME, CAMERA_EXTRINSIC_ROTATION_QUAT,
@@ -91,7 +91,16 @@ class VisionNode(Node):
         #   PointCloudOctomapUpdater 靜默拒收，原因未明；拆成獨立、最小化的 process 後恢復正常。
         #   vision_node 這裡只需要在選定目標時，把合併後的膨脹遮罩發布成一張 Image，
         #   不再需要訂閱原始點雲、也不需要在這裡做逐點過濾。
+        #
+        #   2026-09-15：上面那個「疊加 subscription 導致點雲被拒收」的舊結論，從沒真的
+        #   查出因果機制（「原因未明」），時間點也跟當時 real 模式 /clock 缺失（見
+        #   PROGRESS.md / arm_node 那邊查到的根因）重疊，很可能是同一個 TF 時間戳空窗期
+        #   問題被誤判成別的原因。/clock 修好後這裡重新加一個 subscription 測試，觀察點雲
+        #   發布是否仍然正常；如果之後又發現點雲發不出去，優先懷疑是這裡新增的訂閱。
         self.mask_pub = self.create_publisher(Image, '/target_filter_mask', 10)
+        self._octomap_done_event = threading.Event()
+        self.octomap_done_sub = self.create_subscription(
+            Bool, '/target_filter_done', self._octomap_done_callback, 10)
 
         # --- 狀態 ---
         self.task_completed = False
@@ -111,6 +120,11 @@ class VisionNode(Node):
         # 時 CV2 視窗改用這份的編號畫框，跟終端機顯示同一套 ID，不要各自獨立編號。
         self._interactive_valid = None
         self.latest_tomatoes = []
+        # _maybe_print_and_trigger_pick 算好的 (valid, invalid_reasons, all_occluded)，
+        # 交給 auto_pick_thread 沿用同一份，不要重算一次——重算會讓 build_valid_candidates
+        # 內建的「不能夾的」清單被印兩次，也可能因為兩次呼叫之間 targets 已經更新而
+        # 算出不同編號，跟終端機剛印出來的對不起來。
+        self._pending_valid = None
 
         # 啟動時直接讀入手動校正過的內參，之後 info_callback 收到 camera_info
         # 時會用這組值覆蓋掉相機出廠發布的 K，取代出廠值。只有實機需要，Isaac 模式跳過。
@@ -120,6 +134,10 @@ class VisionNode(Node):
             self.get_logger().info(f'VISION_MODE={VISION_MODE}，不載入手動內參校正檔，直接用 camera_info topic 提供的內參。')
 
         self.get_logger().info('YOLOv11 視覺大腦啟動！手動選擇夾取模式開啟...')
+
+    """cloud_filter_node.py 真的完成過濾+發布後才會收到這個，取代原本固定 sleep 的猜測。"""
+    def _octomap_done_callback(self, msg: Bool):
+        self._octomap_done_event.set()
 
     # -----------------------------------------------------------------
     # 基本 callback
@@ -254,6 +272,16 @@ class VisionNode(Node):
             # 裡的同一個物件——重新指到這一幀真正的番茄物件，讓果梗畫框跟番茄畫框
             # 讀的是同一份 occluded 狀態，紅綠燈才會一起變，不會各跳各的。
             TargetSelector.resolve_live_pairing(detected_objects, detected_tomatoes)
+            # 'paired_tomato' 導正完才能算「果實端點跟番茄中心」的距離（診斷用，見
+            # _finalize_smoothed_stem 裡 calyx_world 的說明），calyx_world 反投影失敗
+            # 或這幀沒配對到番茄就留 None，不列進面板。
+            for obj in detected_objects:
+                obj['calyx_tomato_dist'] = None
+                nt = obj.get('paired_tomato')
+                calyx_world = obj.get('calyx_world')
+                if nt is not None and calyx_world is not None:
+                    obj['calyx_tomato_dist'] = math.dist(
+                        calyx_world, (nt['world_x'], nt['world_y'], nt['world_z']))
             detected_objects = sorted(detected_objects, key=lambda obj: obj['z_center'])
         self.latest_targets = detected_objects
 
@@ -285,6 +313,19 @@ class VisionNode(Node):
             obj['branch_px'], obj['branch_py'], obj['branch_z'],
             fx, fy, ux_img, uy_img, trans)
 
+        # 診斷用：把「果實端點(calyx)」反投影成世界座標存起來，供 resolve_live_pairing()
+        # 把 paired_tomato 導正成『這一幀』的番茄物件之後，再算跟番茄中心的距離——這裡先
+        # 只算 calyx 的世界座標，不能在這裡就用 obj['paired_tomato']：這時候它還是
+        # StemTracker 滑動視窗裡某個舊幀留存的番茄快照，跟這一幀的 calyx 世界座標對不上，
+        # 算出來的距離會是垃圾值（實測量到 0.5m 這種明顯不合理的數字）。
+        calyx_lp = self.coord.backproject_to_local_point(
+            obj['calyx_px'], obj['calyx_py'], obj['calyx_z'], fx, fy, ux_img, uy_img, stamp=stamp)
+        calyx_wp = tf2_geometry_msgs.do_transform_point(calyx_lp, trans)
+        if all(math.isfinite(v) for v in (calyx_wp.point.x, calyx_wp.point.y, calyx_wp.point.z)):
+            obj['calyx_world'] = (calyx_wp.point.x, calyx_wp.point.y, calyx_wp.point.z)
+        else:
+            obj['calyx_world'] = None
+
     """把 cv_image 放大 DISPLAY_SCALE 倍後顯示，只影響視窗大小，不影響偵測/座標計算。"""
     def _show(self, cv_image):
         if DISPLAY_SCALE != 1.0:
@@ -300,11 +341,16 @@ class VisionNode(Node):
             return
         self._last_scan_print = now
 
-        self.visualizer.print_scan_summary(detected_objects, self.latest_tomatoes)
+        # 掃描階段就先算好 valid/invalid_reasons，用它們來編號、印終端機清單——
+        # 跟畫面（_interactive_valid 也是同一份 build_valid_candidates 的產物）保證同一套
+        # ID，使用者才不會照終端機編號選到畫面上完全不同的物理目標。
+        valid, invalid_reasons, all_occluded = self.target_selector.build_valid_candidates(detected_objects)
+        self.visualizer.print_scan_summary(detected_objects, self.latest_tomatoes, valid, invalid_reasons)
 
         if len(detected_objects) > 0:
             self._empty_scan_count = 0
             self.is_processing = True
+            self._pending_valid = (valid, invalid_reasons, all_occluded)
             # daemon=True：夾取流程可能卡在 prompt_choose_id() 等終端輸入，
             # Ctrl+C 產生的 KeyboardInterrupt 只會送到主執行緒；這條非 daemon
             # 的話，主執行緒中斷後整個 process 還是會被這條卡住的執行緒拖著
@@ -332,7 +378,9 @@ class VisionNode(Node):
             self.is_processing = False
             return
 
-        valid, invalid_reasons, all_occluded = self.target_selector.build_valid_candidates(targets)
+        # 沿用 _maybe_print_and_trigger_pick 剛算好、剛印在終端機上的那份，不要重算
+        # （見 self._pending_valid 的說明）。
+        valid, invalid_reasons, all_occluded = self._pending_valid
         pickable = any(vid not in invalid_reasons for vid in valid)
         if not pickable:
             if all_occluded:
@@ -386,11 +434,16 @@ class VisionNode(Node):
 
         # ★ 一次性動作：只在「決定要抓哪顆」的這一刻，用當下偵測到的番茄 mask
         #   建一份已避開目標的點雲塞給 OctoMap，不是持續過濾。
+        # 2026-09-15：改成真的等 cloud_filter_node.py 發來的完成訊號，不再固定 sleep
+        # 猜時間——這樣可以在點雲確實發布完之後盡快動作，不會又提早動（burst 還沒發完
+        # 手臂就先動）也不會平白多等。OCTOMAP_UPDATE_WAIT_SEC 保留當逾時保底，訊號
+        # 遲遲沒來時才強制繼續，避免真的卡死整條流程。
+        self._octomap_done_event.clear()
         self._publish_target_filter_mask(target)
-
-        # MoveIt2 的 PointCloudOctomapUpdater 沒有對外的「處理完成」通知，
-        # 用固定等待時間換取簡單可靠（配合 max_update_rate 抓一個夠用的餘裕）。
-        time.sleep(OCTOMAP_UPDATE_WAIT_SEC)
+        got_signal = self._octomap_done_event.wait(timeout=OCTOMAP_UPDATE_WAIT_SEC)
+        if not got_signal:
+            self.get_logger().warn(
+                f'等待 cloud_filter_node 完成訊號逾時（{OCTOMAP_UPDATE_WAIT_SEC}s 內沒收到），強制繼續。')
 
         target_msg = PoseStamped()
         target_msg.header.stamp = self.get_clock().now().to_msg()
