@@ -1,0 +1,401 @@
+"""
+============================================================================
+ 物件偵測：YOLOv11 分割模型 → 番茄 / 果梗偵測結果
+============================================================================
+ 負責「辨識」這一層：跑模型、篩選重疊偵測、把每個偵測框交給
+ CoordinateEstimator / PedicelSkeletonizer 算出世界座標與抓取資訊，
+ 組成統一格式的 dict 回傳。不碰 ROS 訂閱/發布。
+============================================================================
+"""
+
+import cv2
+import math
+import numpy as np
+import tf2_geometry_msgs
+from ultralytics import YOLO
+from .config import (GRASP_DISTANCE_MODE, GRASP_METHOD, GRASP_RATIO_MAX, GRASP_RATIO_MIN,
+                      GRASP_TARGET_DIST_M, MIN_VALID_DEPTH_M, OVERLAP_SUPPRESS_THRESH,
+                      STEM_CLASS_ID, TOMATO_CLASS_ID, DEPTH_WINDOW, MIN_STEM_DEPTH_PX, YOLO_IOU)
+from .coordinates import CoordinateEstimator
+from .occlusion import OcclusionChecker
+from .skeleton import PedicelSkeletonizer
+from .target_selector import TargetSelector
+
+"""載入 YOLO 模型，把一幀影像跑成 (detected_tomatoes, detected_objects)。"""
+class ObjectDetector:
+
+    """載入 YOLO 模型，設定分類 ID 與座標/骨架化/遮擋判斷輔助模組。"""
+    def __init__(self, model_path: str,
+                 coordinate_estimator: CoordinateEstimator = None,
+                 skeletonizer: PedicelSkeletonizer = None,
+                 occlusion_checker: OcclusionChecker = None,
+                 stem_class_id: int = STEM_CLASS_ID,
+                 tomato_class_id: int = TOMATO_CLASS_ID,
+                 min_stem_depth_px: int = MIN_STEM_DEPTH_PX):
+        self.model = YOLO(model_path)
+        self.stem_class_id = stem_class_id
+        self.tomato_class_id = tomato_class_id
+        self.min_stem_depth_px = min_stem_depth_px
+        self.coord = coordinate_estimator or CoordinateEstimator()
+        self.skeletonizer = skeletonizer or PedicelSkeletonizer()
+        self.occlusion = occlusion_checker or OcclusionChecker()
+        self._prev_pairs = []   # 上一幀配對結果 [(stem_pos, tomato_pos), ...]，供配對做時間穩定用
+        self._prev_reverse = []  # 上一幀「哪端是果實端」判定 [(stem_pos, is_end1), ...]，同樣供時間穩定用
+
+    """多個果梗 mask 互相重疊超過門檻時，只保留面積較大的那個 (避免同一根果梗被偵測兩次)。"""
+    @staticmethod
+    def suppress_overlapping_masks(indices, mask_data_all, target_wh, overlap_thresh: float = OVERLAP_SUPPRESS_THRESH):
+        info = []
+        for i in indices:
+            m = cv2.resize(mask_data_all[i], target_wh, interpolation=cv2.INTER_NEAREST)
+            mb = m > 0.5
+            area = int(mb.sum())
+            if area > 0:
+                info.append((i, mb, area))
+
+        info.sort(key=lambda t: t[2], reverse=True)
+        keep_idxs = []
+        kept = []
+        for i, mb, area in info:
+            is_dup = False
+            for kmb, karea in kept:
+                smaller = min(area, karea)
+                inter = int(np.logical_and(mb, kmb).sum())
+                if smaller > 0 and inter / smaller >= overlap_thresh:
+                    is_dup = True
+                    break
+            if not is_dup:
+                keep_idxs.append(i)
+                kept.append((mb, area))
+        return set(keep_idxs)
+    
+    """跑一次 YOLO 推論，回傳原始 results（給呼叫端需要時使用）。"""
+    def predict(self, cv_image, imgsz, conf, iou=YOLO_IOU):
+        return self.model.predict(cv_image, imgsz=imgsz, conf=conf, iou=iou, verbose=False)
+
+    """跑完一次 YOLO 結果，回傳 (detected_tomatoes, detected_objects)。不畫框（畫框交給 visualizer）。"""
+    def detect(self, cv_image, results, fx, fy, ux_img, uy_img, trans, depth_img, stamp=None):
+        detected_tomatoes = []
+        detected_objects = []
+
+        for r in results:
+            if r.boxes is None:
+                continue
+            cls_ids = r.boxes.cls.cpu().numpy()
+            boxes_all = r.boxes.xyxy.cpu().numpy()
+            confs_all = r.boxes.conf.cpu().numpy()
+            has_masks = r.masks is not None
+            mask_data_all = r.masks.data.cpu().numpy() if has_masks else None
+            h_img, w_img = cv_image.shape[:2]
+
+            stem_idxs = [j for j in range(len(cls_ids)) if int(cls_ids[j]) == self.stem_class_id]
+            if has_masks and len(stem_idxs) > 1:
+                keep_stem_idxs = self.suppress_overlapping_masks(stem_idxs, mask_data_all, (w_img, h_img))
+            else:
+                keep_stem_idxs = set(stem_idxs)
+
+            # 遮擋判斷需要「同一幀所有其他 instance 的 bbox」，先把番茄/果梗的 bbox 收集起來
+            tomato_idxs = [j for j in range(len(cls_ids)) if int(cls_ids[j]) == self.tomato_class_id]
+            tomato_boxes_all = [tuple(boxes_all[j]) for j in tomato_idxs]
+            stem_boxes_kept = [tuple(boxes_all[j]) for j in keep_stem_idxs]
+
+            for local_i, i in enumerate(tomato_idxs):
+                other_boxes = [bx for k, bx in enumerate(tomato_boxes_all) if k != local_i] + stem_boxes_kept
+                self._process_tomato_detection(boxes_all[i], fx, fy, ux_img, uy_img, trans, depth_img,
+                                                detected_tomatoes,
+                                                mask_data_all[i] if has_masks else None,
+                                                w_img, h_img, stamp, other_boxes)
+
+            if has_masks:
+                # 配對跟判斷哪端是果實端(calyx)一起做：果梗兩個骨架端點分別跟每顆番茄的
+                # 頂端接點算 3D 距離，全域由近到遠貪婪配對，贏的那一端就是果實端——
+                # 不能每根果梗各自獨立找「最近番茄」，沒有唯一性保證，容易好幾根搶到
+                # 同一顆番茄；細節見 TargetSelector.assign_stem_tomato_pairs。
+                prepared = []
+                for i in sorted(keep_stem_idxs):
+                    p = self._prepare_stem_geometry(boxes_all[i], i, mask_data_all, w_img, h_img,
+                                                      fx, fy, ux_img, uy_img, trans, depth_img, stamp)
+                    if p is not None:
+                        prepared.append(p)
+
+                pairs, reverse_map = TargetSelector.assign_stem_tomato_pairs(
+                    prepared, detected_tomatoes, prev_pairs=self._prev_pairs,
+                    prev_reverse=self._prev_reverse)
+
+                new_prev_pairs = []
+                new_prev_reverse = []
+                for p in prepared:
+                    anchor_t = pairs.get(id(p))
+                    if anchor_t is None:
+                        self._register_unpaired_stem(p, fx, fy, ux_img, uy_img, trans, depth_img,
+                                                      confs_all, detected_objects, stamp)
+                        continue
+                    reverse = reverse_map[id(p)]
+                    fingerprint = tuple((a + b) / 2.0 for a, b in zip(p['end0_world'], p['end1_world']))
+                    new_prev_pairs.append((fingerprint,
+                                            (anchor_t['world_x'], anchor_t['world_y'], anchor_t['world_z'])))
+                    new_prev_reverse.append((fingerprint, reverse))
+                    self._finish_stem_detection(p, anchor_t, reverse, fx, fy, ux_img, uy_img, trans, depth_img,
+                                                 confs_all, detected_objects, stamp)
+                self._prev_pairs = new_prev_pairs
+                self._prev_reverse = new_prev_reverse
+
+        return detected_tomatoes, detected_objects
+
+    """單一番茄 (class 1) 偵測框 → 算世界座標 + 遮擋判斷、寫進 detected_tomatoes。
+    需要有 mask 才能取深度 (raw_mask 沒給就跳過這個偵測)；mask 同時存進 dict 供選定為
+    目標時的點雲過濾用。畫框交給 visualizer（需要本幀完整果梗清單才能判斷配對）。"""
+    def _process_tomato_detection(self, b, fx, fy, ux_img, uy_img, trans, depth_img,
+                                   detected_tomatoes, raw_mask=None, w_img=None, h_img=None, stamp=None,
+                                   other_boxes=None):
+        if raw_mask is None or w_img is None or h_img is None:
+            return
+
+        m_resized = cv2.resize(raw_mask, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+        mask_bin_t = (m_resized > 0.5).astype(np.uint8) * 255
+
+        metrics = self.occlusion.compute_shape_metrics(mask_bin_t)
+        occluded, occlusion_reason, _ = self.occlusion.judge_occlusion(metrics, tuple(b), other_boxes or [])
+
+        cx_t = int((b[0] + b[2]) / 2)
+        cy_t = int((b[1] + b[3]) / 2)
+
+        # 整個 mask 取深度中位數，不用 bbox 中心點開視窗——番茄被遮擋時常常是中間缺一塊
+        # (mask 變成不規則形狀)，bbox 中心點很容易剛好落在缺角/遮擋縫隙裡，導致視窗內完全
+        # 沒有 mask 像素、直接判定失敗，整顆番茄就這樣消失掉（跟果梗那邊踩到的是同一種坑）。
+        z_t = self.coord.median_depth_in_mask(depth_img, mask_bin_t, 1)
+        if z_t is None:
+            return
+        z_t = self.coord.to_meters(z_t)
+        if z_t <= MIN_VALID_DEPTH_M:
+            return
+
+        w_pixel, h_pixel = b[2] - b[0], b[3] - b[1]
+        avg_pixel_size = (w_pixel + h_pixel) / 2.0
+        f_avg = (fx + fy) / 2.0
+        tomato_radius = (avg_pixel_size * z_t) / f_avg / 2.0
+        z_center_t = z_t + tomato_radius
+
+        lp = self.coord.backproject_to_local_point(cx_t, cy_t, z_center_t, fx, fy, ux_img, uy_img, stamp=stamp)
+        wp = tf2_geometry_msgs.do_transform_point(lp, trans)
+
+        if not all(math.isfinite(v) for v in (wp.point.x, wp.point.y, wp.point.z)):
+            return
+
+        detected_tomatoes.append({
+            'cx': cx_t, 'cy': cy_t,
+            'bbox': b,
+            'world_x': wp.point.x, 'world_y': wp.point.y, 'world_z': wp.point.z,
+            'depth': z_t,        # 表面深度 (相機讀到的原始深度，公尺，尚未加上番茄半徑)
+            'z_center': z_center_t,   # 加上番茄半徑後的中心深度，跟 world_x/y/z 用同一個值算出來的，供果梗端平滑用
+            'mask': mask_bin_t,
+            'occluded': occluded,
+            'occlusion_reason': occlusion_reason,
+            'aspect_ratio': metrics['aspect_ratio'] if metrics is not None else None,
+            'solidity': metrics['solidity'] if metrics is not None else None,
+        })
+        # 番茄框框顏色（要不要標紅/綠）要看它有沒有配對到果梗，這件事只有拿到本幀
+        # 全部果梗清單後才能判斷，所以畫框改到 visualizer.draw_tracked_overlay 那邊做。
+
+    """單一像素點 + mask（用來在該點附近取深度中位數）→ 世界座標；任一步失敗回傳 None。"""
+    def _pixel_to_world(self, px, py, mask_bin, depth_img, fx, fy, ux_img, uy_img, trans, stamp=None):
+        z = self.coord.median_depth_in_mask(depth_img, mask_bin, self.min_stem_depth_px, cx=px, cy=py)
+        if z is None:
+            return None
+        z = self.coord.to_meters(z)
+        if z <= MIN_VALID_DEPTH_M:
+            return None
+        lp = self.coord.backproject_to_local_point(px, py, z, fx, fy, ux_img, uy_img, stamp=stamp)
+        wp = tf2_geometry_msgs.do_transform_point(lp, trans)
+        if not all(math.isfinite(v) for v in (wp.point.x, wp.point.y, wp.point.z)):
+            return None
+        return (wp.point.x, wp.point.y, wp.point.z)
+
+    """第一階段：果梗 mask → 骨架化 → 兩個端點的世界座標，供 detect() 統一跟番茄配對
+    （配對跟判斷哪端是果實端一起做，見 TargetSelector.assign_stem_tomato_pairs）。
+    回傳 dict 或 None（骨架化/深度任一步失敗）。"""
+    def _prepare_stem_geometry(self, b, i, mask_data_all, w_img, h_img,
+                                fx, fy, ux_img, uy_img, trans, depth_img, stamp=None):
+        m_resized = cv2.resize(mask_data_all[i], (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+        mask_bin = (m_resized > 0.5).astype(np.uint8) * 255
+
+        _, _, approx_skeleton = self.skeletonizer.skeletonize_pedicel(mask_bin)
+        if approx_skeleton is None:
+            return None
+        approx_path = self.skeletonizer.order_skeleton_path(approx_skeleton)
+        if len(approx_path) < 2:
+            return None
+
+        end0_y, end0_x = approx_path[0]
+        end1_y, end1_x = approx_path[-1]
+        end0_world = self._pixel_to_world(end0_x, end0_y, mask_bin, depth_img, fx, fy, ux_img, uy_img, trans, stamp)
+        end1_world = self._pixel_to_world(end1_x, end1_y, mask_bin, depth_img, fx, fy, ux_img, uy_img, trans, stamp)
+        if end0_world is None or end1_world is None:
+            return None
+
+        return {
+            'b': b, 'i': i, 'mask_bin': mask_bin,
+            'end0_world': end0_world, 'end1_world': end1_world,
+            'end0_px': (end0_x, end0_y), 'end1_px': (end1_x, end1_y),
+        }
+
+    """偵測到、但沒配對到番茄的果梗：只登記「這裡有一根果梗」這件事，不猜哪端是果實端、
+    不算抓取點/方向向量——沒有番茄配對就沒有依據判斷方向，猜錯的話會混進 StemTracker
+    的平滑歷史，污染之後（配對成功時）算出來的抓取點/方向（見 _finish_stem_detection
+    開頭那段說明）。深度用整個 mask 的中位數（跟 _process_tomato_detection 算番茄深度
+    同一招，不挑特定像素、不依賴骨架排序），純粹讓這根果梗能出現在偵測清單／終端機
+    列印裡；'paired_tomato' 固定 None，check_candidate 會直接判定「沒有配對到番茄」，
+    不會被誤判成可夾取目標，也不會被 visualizer 畫框（見 visualizer.py 的過濾條件）。
+    偵測（有沒有找到果梗）跟配對（配到哪顆番茄）是兩件事，不該因為配對失敗就讓偵測
+    結果整個消失不見。"""
+    def _register_unpaired_stem(self, prep, fx, fy, ux_img, uy_img, trans, depth_img,
+                                 confs_all, detected_objects, stamp=None):
+        b, i, mask_bin = prep['b'], prep['i'], prep['mask_bin']
+        z = self.coord.median_depth_in_mask(depth_img, mask_bin, 1)
+        if z is None:
+            return
+        z = self.coord.to_meters(z)
+        if z <= MIN_VALID_DEPTH_M:
+            return
+
+        cx_pixel = int((b[0] + b[2]) / 2)
+        cy_pixel = int((b[1] + b[3]) / 2)
+        local_point = self.coord.backproject_to_local_point(cx_pixel, cy_pixel, z, fx, fy, ux_img, uy_img,
+                                                              stamp=stamp)
+        world_point = tf2_geometry_msgs.do_transform_point(local_point, trans)
+        if not all(math.isfinite(v) for v in (world_point.point.x, world_point.point.y, world_point.point.z)):
+            return
+
+        detected_objects.append({
+            'bbox': b,
+            'cx': cx_pixel, 'cy': cy_pixel,
+            'z_real': z, 'z_center': z,
+            'world_x': world_point.point.x,
+            'world_y': world_point.point.y,
+            'world_z': world_point.point.z,
+            'end0_px': prep['end0_px'],
+            'end1_px': prep['end1_px'],
+            'conf': float(confs_all[i]),
+            'mask': mask_bin,
+            'paired_tomato': None,
+        })
+
+    """第二階段：配對階段已經決定好哪端是果實端(calyx)（reverse=True 代表 end1 是），
+    這裡只管正式算抓取點、3D 方向向量與世界座標，寫進 detected_objects。
+    不退回 y 座標猜方向——沒配對到番茄的果梗在 detect() 就已經被擋掉，不會走到這裡；
+    猜錯方向的資料一旦混進 StemTracker 的平滑歷史，會把同一個 track 的加權平均污染掉。"""
+    def _finish_stem_detection(self, prep, anchor_t, reverse, fx, fy, ux_img, uy_img, trans, depth_img,
+                                confs_all, detected_objects, stamp=None):
+        b, i, mask_bin = prep['b'], prep['i'], prep['mask_bin']
+
+        # 'distance' 模式要逐點量深度、轉 3D 座標再算弧長（見 coordinates.py
+        # find_grasp_point_by_3d_distance 的說明），這裡自己拿 ordered_path 交給它；
+        # 'ratio' 模式維持原本純 2D 骨架流程，直接用 get_stem_grasp_point。
+        if GRASP_METHOD == 'distance':
+            clean, eroded, skeleton = self.skeletonizer.skeletonize_pedicel(mask_bin)
+            if skeleton is None:
+                return
+            ordered_path = self.skeletonizer.order_skeleton_path(skeleton, reverse=reverse)
+            if len(ordered_path) < 2:
+                return
+            if GRASP_DISTANCE_MODE == 'chord_ratio':
+                result = self.coord.find_grasp_point_by_chord_ratio(
+                    ordered_path, mask_bin, depth_img, fx, fy, ux_img, uy_img, GRASP_TARGET_DIST_M)
+            else:
+                result = self.coord.find_grasp_point_by_3d_distance(
+                    ordered_path, mask_bin, depth_img, fx, fy, ux_img, uy_img,
+                    GRASP_TARGET_DIST_M, GRASP_RATIO_MIN, GRASP_RATIO_MAX)
+            if result is None:
+                return
+            grasp_point, grasp_idx = result
+            gy, gx = grasp_point
+            cx_pixel, cy_pixel = int(gx), int(gy)
+            stem_angle = self.skeletonizer.compute_growth_angle(ordered_path, grasp_idx)
+        else:
+            grasp = self.skeletonizer.get_stem_grasp_point(mask_bin, GRASP_RATIO_MIN, GRASP_RATIO_MAX,
+                                                             reverse=reverse)
+            if grasp is None:
+                return
+            cx_pixel, cy_pixel, stem_angle, ordered_path, grasp_idx = grasp
+        tip_y, tip_x = ordered_path[0]      # 判定為果實端(calyx)的端點像素座標
+        root_y, root_x = ordered_path[-1]   # 判定為枝條端(branch)的端點像素座標
+
+        # 骨架兩端點各自的深度（之前只存了像素座標，沒量深度，沒辦法平滑）
+        tip_z = self.coord.median_depth_for_stem(depth_img, mask_bin, tip_x, tip_y,
+                                                   DEPTH_WINDOW, self.min_stem_depth_px)
+        tip_z = self.coord.to_meters(tip_z) if tip_z is not None else None
+        root_z = self.coord.median_depth_for_stem(depth_img, mask_bin, root_x, root_y,
+                                                     DEPTH_WINDOW, self.min_stem_depth_px)
+        root_z = self.coord.to_meters(root_z) if root_z is not None else None
+
+        pedicel_dir = self.coord.estimate_pedicel_direction(
+            ordered_path, grasp_idx, depth_img,
+            fx, fy, ux_img, uy_img, trans,
+            mask_bin=mask_bin)
+
+        z_real = self.coord.median_depth_for_stem(depth_img, mask_bin, cx_pixel, cy_pixel,
+                                                    DEPTH_WINDOW, self.min_stem_depth_px)
+        if z_real is None:
+            return
+        z_real = self.coord.to_meters(z_real)
+        if z_real <= MIN_VALID_DEPTH_M:
+            return
+        z_center = z_real
+
+        local_point = self.coord.backproject_to_local_point(cx_pixel, cy_pixel, z_center, fx, fy, ux_img, uy_img,
+                                                              stamp=stamp)
+        world_point = tf2_geometry_msgs.do_transform_point(local_point, trans)
+
+        if not all(math.isfinite(v) for v in (world_point.point.x, world_point.point.y, world_point.point.z)):
+            return
+
+        # pedicel_dir 是 dict（見 estimate_pedicel_direction）：這一幀當場算出的 vx/vy/vz，
+        # 加上 calyx/branch 兩端的『像素座標+深度』源頭資料——後者才是 StemTracker 要拿去
+        # 跨幀平滑的東西，平滑完再反投影一次，不是平滑這裡算出來的 vx/vy/vz。算不出來就用
+        # 抓取點自己的像素+深度頂替兩端，等於這一幀的向量退化成 (0,0,-1)（垂直向下）。
+        if pedicel_dir is not None:
+            vx, vy, vz = pedicel_dir['vx'], pedicel_dir['vy'], pedicel_dir['vz']
+            calyx_px, calyx_py, calyx_z = pedicel_dir['calyx_px'], pedicel_dir['calyx_py'], pedicel_dir['calyx_z']
+            branch_px, branch_py, branch_z = (pedicel_dir['branch_px'], pedicel_dir['branch_py'],
+                                               pedicel_dir['branch_z'])
+        else:
+            vx, vy, vz = 0.0, 0.0, -1.0
+            calyx_px, calyx_py, calyx_z = cx_pixel, cy_pixel, z_center
+            branch_px, branch_py, branch_z = cx_pixel, cy_pixel, z_center
+
+        # 骨架兩端點的深度量不到就退回抓取點自己的深度，不要讓 None 混進平滑歷史
+        if tip_z is None:
+            tip_z = z_center
+        if root_z is None:
+            root_z = z_center
+
+        detected_objects.append({
+            'bbox': b,
+            'cx': cx_pixel, 'cy': cy_pixel,
+            'z_real': z_real, 'z_center': z_center,
+            'world_x': world_point.point.x,
+            'world_y': world_point.point.y,
+            'world_z': world_point.point.z,
+            'path_len': len(ordered_path),        # debug：骨架路徑點數，抓取點亂跳時比對用
+            'grasp_idx': grasp_idx,               # debug：抓取點在骨架路徑上的索引，方向向量亂跳時比對用
+            'tip_px': (tip_x, tip_y),              # 判定為果實端(calyx)的端點像素座標
+            'root_px': (root_x, root_y),           # 判定為枝條端(branch)的端點像素座標
+            'end0_px': prep['end0_px'],            # 兩個原始候選端點(未判斷方向前)，畫面比對用
+            'end1_px': prep['end1_px'],
+            'angle': stem_angle,
+            'vx': vx, 'vy': vy, 'vz': vz,
+            # 方向向量的源頭資料（像素+相機座標系深度，未反投影）：跨幀平滑用這組，不是 vx/vy/vz
+            'calyx_px': calyx_px, 'calyx_py': calyx_py, 'calyx_z': calyx_z,
+            'branch_px': branch_px, 'branch_py': branch_py, 'branch_z': branch_z,
+            # 骨架兩端點（真正的路徑頭尾，不是 calyx/branch 那兩簇）的像素+深度，供平滑用
+            'tip_x': float(tip_x), 'tip_y': float(tip_y), 'tip_z': tip_z,
+            'root_x': float(root_x), 'root_y': float(root_y), 'root_z': root_z,
+            # 配對到的番茄中心，像素+深度，供平滑用（跟 TomatoTracker 自己的平滑是分開的
+            # 兩套機制，這裡是要讓果梗這邊的向量計算，能在同一個時間窗口裡取用番茄中心）
+            'tomato_cx': float(anchor_t.get('cx', cx_pixel)),
+            'tomato_cy': float(anchor_t.get('cy', cy_pixel)),
+            'tomato_z': float(anchor_t.get('z_center', anchor_t.get('depth', z_center))),
+            'conf': float(confs_all[i]),
+            'mask': mask_bin,   # 果梗二值遮罩，供選定為目標時的點雲過濾用
+            'paired_tomato': anchor_t,   # 配對只在這裡算一次，後面一律讀這個欄位，不重新配對
+        })
