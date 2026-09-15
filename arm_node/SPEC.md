@@ -99,7 +99,7 @@ RETURN(Home) 完成 → 停頓 PAUSE_BEFORE_IDLE → 放開夾爪 → 回精定�
 
 - **障礙物**（`config.OBSTACLES`）：world collision object（`is_diff=True` 累加），`car` 模式空清單、`lab` 模式有桌面/隔板/電腦/牆/籃子共 6 個
 - **車體**（`ENABLE_CAR_BODY`，僅 `car` 模式開）：掛在 `base` 下的長方體，`touch_links=[base, link_1]`，隨基座移動
-- **虛擬夾爪**（`ENABLE_VIRTUAL_GRIPPER`，兩模式皆開）：左右手指各兩段碰撞體（手指本體固定尺寸 + 延伸段依 `MODE` 給不同大小），分開掛在 `left_finger_link`／`right_finger_link` 上，會隨夾爪開合一起動
+- **虛擬夾爪**（`ENABLE_VIRTUAL_GRIPPER`，兩模式皆開）：左右手指各一個碰撞體（單一長方體，尺寸依 `MODE` 給不同大小，對應各自場景的真實夾爪形狀），分開掛在 `left_finger_link`／`right_finger_link` 上，會隨夾爪開合一起動
 
 ## 07 設定參數（`config.py`）
 
@@ -111,7 +111,7 @@ RETURN(Home) 完成 → 停頓 PAUSE_BEFORE_IDLE → 放開夾爪 → 回精定�
 | `OBSTACLES` | `[]` | 6 個固定障礙物 | 桌面/隔板/電腦/牆/籃子等 |
 | `POSE_HOME_DEG` | `[-90,-15,65,-50,90,0]` | `[0,-15,65,-50,90,0]` | 初始關節角（度） |
 | `POSE_FINE_DEG` | `[-90,-7,125,-118,90,0]` | `[0,-10,135,-125,90,0]` | 精定位關節角（度） |
-| `VG_FINGER_EXT_SIZE` | `[0.005,0.005,0.01]` | `[0.005,0.005,0.015]` | 虛擬夾爪手指延伸段尺寸 |
+| `VG_FINGER_SIZE` | `[0.005,0.005,0.05]` | `[0.005,0.01,0.05]` | 虛擬夾爪單根手指碰撞體尺寸 `[X,Y,Z]` |
 
 ### 共用參數
 

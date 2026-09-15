@@ -19,7 +19,7 @@ ARM_MODE = os.environ.get('ARM_MODE', 'real').strip().lower()
 if ARM_MODE not in ('real', 'isaac'):
     ARM_MODE = 'isaac'
 
-MODE = 'car'   # 'car' 或 'lab' ← 只改這一行切換環境
+MODE = 'lab'   # 'car' 或 'lab' ← 只改這一行切換環境
 
 
 # ===========================================================================
@@ -38,17 +38,17 @@ if MODE == 'car':
     # 實測、往前推 30cm 算出來。
     FAKE_COARSE_TOMATO_POSE = (-0.1223, -0.7242, 0.4838, 0.707107, 0.0, 0.0, 0.707107, math.radians(-90.0))
 
-    VG_FINGER_EXT_SIZE = [0.005, 0.005, 0.01]
+    VG_FINGER_SIZE = [0.005, 0.005, 0.05]   # 單根手指（虛擬夾爪碰撞體）[X, Y, Z]，對應 car 真實夾爪形狀
 
 elif MODE == 'lab':
     ENABLE_CAR_BODY = False
     OBSTACLES = [
         {'id': 'table',           'type': 'cube',     'pos': [0.75, -0.1325, 0.03],     'size': [0.7, 1.205, 0.03]},
-        {'id': 'front_partition', 'type': 'cube',     'pos': [1.125, -0.1325, 0.29575], 'size': [0.05, 1.205, 0.5015]},
-        {'id': 'side_partition',  'type': 'cube',     'pos': [0.499, 0.495, 0.29575],   'size': [1.202, 0.05, 0.5015]},
-        {'id': 'computer',        'type': 'cube',     'pos': [0.7, -0.635, 0.25],       'size': [0.46, 0.18, 0.41]},
-        {'id': 'wall',            'type': 'cube',     'pos': [-0.5, 0.0, 0.5],          'size': [0.06, 2.0, 1.5]},
-        {'id': 'basket',          'type': 'cylinder', 'pos': [0.55, -0.63, 0.5063],     'size': [0.1, 0.075]},  # [高, 半徑]
+        #{'id': 'front_partition', 'type': 'cube',     'pos': [1.125, -0.1325, 0.29575], 'size': [0.05, 1.205, 0.5015]},
+        #{'id': 'side_partition',  'type': 'cube',     'pos': [0.499, 0.495, 0.29575],   'size': [1.202, 0.05, 0.5015]},
+        #{'id': 'computer',        'type': 'cube',     'pos': [0.7, -0.635, 0.25],       'size': [0.46, 0.18, 0.41]},
+        #{'id': 'wall',            'type': 'cube',     'pos': [-0.5, 0.0, 0.5],          'size': [0.06, 2.0, 1.5]},
+        #{'id': 'basket',          'type': 'cylinder', 'pos': [0.55, -0.63, 0.5063],     'size': [0.1, 0.075]},  # [高, 半徑]
     ]
 
     #POSE_HOME_DEG = [0.0, -15.0, 65.0, -50.0, 90.0, 0.0]
@@ -60,7 +60,7 @@ elif MODE == 'lab':
     # 實測、往前推 30cm 算出來。
     FAKE_COARSE_TOMATO_POSE = (0.7041, -0.1223, 0.3892, 0.5, 0.5, 0.5, 0.5, math.radians(0.0))
 
-    VG_FINGER_EXT_SIZE = [0.005, 0.005, 0.015]
+    VG_FINGER_SIZE = [0.005, 0.02, 0.075]   # 單根手指（虛擬夾爪碰撞體）[X, Y, Z]，對應 lab 真實夾爪形狀
 
 else:
     raise ValueError(f'未知 MODE: {MODE!r}，只能是 "car" 或 "lab"')
@@ -79,10 +79,9 @@ PLANNER_ID   = 'RRTstarkConfigDefault'
 ARM_JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 
 # --- 夾爪幾何與開合量 -------------------------------------------------------
-GRIPPER_LENGTH  = 0.16      # isaac_法蘭面到夾爪咬合中心的距離 (m)
-#GRIPPER_LENGTH  = 0.17      # real_法蘭面到夾爪咬合中心的距離 (m)
+#GRIPPER_LENGTH  = 0.16      # isaac_法蘭面到夾爪咬合中心的距離 (m)
+GRIPPER_LENGTH  = 0.175      # real_法蘭面到夾爪咬合中心的距離 (m)
 APPROACH_DIST   = 0.10      # 預備點 A 沿接近軸再往後退多少 (m)
-
 GRIPPER_PREOPEN = 0.010     # 出發前先張開
 GRIPPER_GRASP   = 0.015     # 到位後夾緊
 GRIPPER_RELEASE = 0.0       # 放開 / 收合
@@ -94,14 +93,9 @@ GRIPPER_IO_PIN         = 0
 GRIPPER_IO_OPEN_STATE  = 0.0   # 開
 GRIPPER_IO_CLOSE_STATE = 1.0   # 閉
 
-# 虛擬夾爪碰撞體
-VG_FINGER_SIZE   = [0.005, 0.005, 0.05]   # 單根手指本體 [X, Y, Z]
-VG_FINGER_Z      = 0.062                  # 手指本體中心沿「該手指 link 自己的 z 軸」的位置
+# 虛擬夾爪碰撞體（VG_FINGER_SIZE 依 MODE 決定，見上方，對應各自場景的真實夾爪形狀）
+VG_FINGER_Z      = 0.062                  # 手指中心沿「該手指 link 自己的 z 軸」的位置
 VG_FINGER_OFF_X  = 0.012                  # 兩指往中間收的局部 X 偏移量
-
-# 手指延伸段（VG_FINGER_EXT_SIZE 依 MODE 決定，見上方）
-VG_FINGER_EXT_Z  = (VG_FINGER_Z + VG_FINGER_SIZE[2] / 2.0
-                     + VG_FINGER_EXT_SIZE[2] / 2.0)
 VG_TOUCH_LINKS   = ['left_finger_link', 'right_finger_link', 'gripper_base_link']
 
 # --- 車體 (掛在 base 底下，隨基座移動) --------------------------------------
@@ -148,7 +142,7 @@ JOINT_VEL, JOINT_ACC = 0.2, 0.2    # 關節空間移動
 POSE_VEL,  POSE_ACC  = 0.2, 0.2    # OMPL 位姿移動
 CART_VEL,  CART_ACC  = 0.15, 0.15    # 笛卡爾直線
 
-PLAN_TIME_JOINT = 1.5
+PLAN_TIME_JOINT = 3.0
 PLAN_TIME_POSE  = 5.0
 PLAN_ATTEMPTS   = 15
 
@@ -178,8 +172,8 @@ J6_TOLERANCE = math.radians(90.0)
 GO_TO_BASKET        = False   # True = 夾完先去籃子放；False = 直接回 Home
 RETURN_HOME_MAX_RETRIES = 3   # 任何一步失敗後，退回初始姿態最多重試幾次才放棄、轉 IDLE 請人工檢查
 ENABLE_ALT_VIEW = True   # False = 全部候選被遮擋時直接回初始位置，不切換備用視角重掃
-PAUSE_AT_APPROACH   = 1.0     # 抵達點 A 後停頓 (s)
-PAUSE_AFTER_GRASP   = 1.5     # 夾緊後停頓
-PAUSE_AFTER_RELEASE = 1.0     # 放開後停頓
-PAUSE_BEFORE_IDLE   = 1.0     # 回 Home 後等手臂穩定
+PAUSE_AT_APPROACH   = 0.3     # 抵達點 A 後停頓 (s)
+PAUSE_AFTER_GRASP   = 1.0     # 夾緊後停頓
+PAUSE_AFTER_RELEASE = 0.3     # 放開後停頓
+PAUSE_BEFORE_IDLE   = 0.5     # 回 Home 後等手臂穩定
 PAUSE_BEFORE_SCAN   = 1.0     # 抵達精定位後、開始偵測前停頓

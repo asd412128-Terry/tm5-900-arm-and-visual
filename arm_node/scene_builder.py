@@ -82,21 +82,13 @@ class SceneBuilder:
                                        ('virtual_gripper_right', 'right_finger_link', +1.0)):
             prims, poses = [], []
 
-            # 手指本體
+            # 手指
             prims.append(SolidPrimitive(type=SolidPrimitive.BOX, dimensions=list(config.VG_FINGER_SIZE)))
             fp = Pose()
             fp.position.x = sign * config.VG_FINGER_OFF_X
             fp.position.z = config.VG_FINGER_Z
             fp.orientation.w = 1.0
             poses.append(fp)
-
-            # 手指延伸段
-            prims.append(SolidPrimitive(type=SolidPrimitive.BOX, dimensions=list(config.VG_FINGER_EXT_SIZE)))
-            ep = Pose()
-            ep.position.x = sign * config.VG_FINGER_OFF_X
-            ep.position.z = config.VG_FINGER_EXT_Z
-            ep.orientation.w = 1.0
-            poses.append(ep)
 
             co = CollisionObject(id=name, operation=CollisionObject.ADD)
             co.header.frame_id = link_name
