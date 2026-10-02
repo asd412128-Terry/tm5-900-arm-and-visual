@@ -8,7 +8,7 @@
 
 `vision_node` 是溫室番茄採收機械臂的視覺大腦：訂閱 RGB-D 相機影像，用 YOLOv11 分割模型同時辨識「番茄」與「果梗」，把果梗骨架化找出抓取點與 3D 生長方向，反投影成世界座標後，交給操作者在終端機手動選定一顆目標，再發布抓取姿態給手臂端執行。
 
-整包程式把「算」跟「串接」分開：`detector` / `coordinates` / `skeleton` / `stem_tracker` / `target_selector` / `mask_publisher` 都是不碰 ROS 訂閱/發布的純運算模組，唯一負責訂閱、發布、跨模組協調的是 `vision_node.py` 這支主節點。
+整包程式把「算」跟「串接」分開：`fine_detector` / `coordinates` / `fine_skeleton` / `fine_stem_tracker` / `fine_target_selector` / `fine_mask_publisher` 都是不碰 ROS 訂閱/發布的純運算模組，唯一負責訂閱、發布、跨模組協調的是 `fine_node.py` 這支主節點。
 
 ## 01 系統情境
 
@@ -16,7 +16,7 @@
 
 - 相機來源（Isaac Sim 或相機驅動）— 發布 `/camera/color/image_raw`、`/camera/depth/image_rect_raw`、`/camera/camera_info`
 - 手臂控制節點（`arm_node`）— 發布 `/robot_status`，訂閱 `/target_pose`、`/vision_status`
-- `cloud_filter_node.py`（`vision_node/` 目錄下的獨立節點，跟 `vision_node.py` 分開啟動成不同 process）— 訂閱 `/target_filter_mask`，做一次性點雲過濾，交給 MoveIt2 OctoMap 更新避障地圖
+- `cloud_filter_node.py`（`vision_node/` 目錄下的獨立節點，跟 `fine_node.py` 分開啟動成不同 process）— 訂閱 `/target_filter_mask`，做一次性點雲過濾，交給 MoveIt2 OctoMap 更新避障地圖
 
 流向：相機三路訊號 + 手臂狀態 → `vision_node` → 抓取指令（`/target_pose`）與空目標通知（`/vision_status`）回手臂 → 選定目標當下發布 `/target_filter_mask` → `cloud_filter_node.py` → MoveIt2 OctoMap。
 
@@ -26,21 +26,21 @@
 
 ## 02 模組架構
 
-除了 `vision_node.py`，其餘模組都不 import ROS 發布/訂閱機制，方便單獨測試。
+除了 `fine_node.py`，其餘模組都不 import ROS 發布/訂閱機制，方便單獨測試。
 
 | 檔案 | 職責 |
 |---|---|
-| `main.py` | 進入點：`rclpy.init` → 建立 `VisionNode` → `spin` → 收尾銷毀節點與 OpenCV 視窗 |
-| `vision_node.py` | 主節點：ROS 訂閱/發布、TF 廣播與查詢、callback 串接，協調以下所有模組 |
+| `fine_main.py` | 進入點：`rclpy.init` → 建立 `VisionNode` → `spin` → 收尾銷毀節點與 OpenCV 視窗 |
+| `fine_node.py` | 主節點：ROS 訂閱/發布、TF 廣播與查詢、callback 串接，協調以下所有模組 |
 | `config.py` | 全域常數集中定義（模型路徑、YOLO 參數、frame 名稱、深度/追蹤/選取/遮罩門檻），其餘模組一律從這裡 import，不重複定義 |
-| `detector.py` | `ObjectDetector`：載入 YOLO 模型、跑推論、依 class 分流番茄/果梗、果梗重疊抑制，組成統一格式的偵測結果 |
+| `fine_detector.py` | `ObjectDetector`：載入 YOLO 模型、跑推論、依 class 分流番茄/果梗、果梗重疊抑制，組成統一格式的偵測結果 |
 | `coordinates.py` | `CoordinateEstimator`：像素+深度反投影成世界座標、深度中位數估算、果梗 3D 方向向量估計 |
-| `skeleton.py` | `PedicelSkeletonizer`：果梗 mask 清理 → 骨架化 → 兩次 BFS 找最長路徑（樹的直徑）排序骨架 → 依比例取抓取點與生長角度。純 2D 像素運算 |
-| `stem_tracker.py` | `StemTracker`：滑動視窗時間平滑，用像素距離配對前後幀同一根果梗，視窗內挑信心分數最高的一筆整包輸出 |
-| `target_selector.py` | `TargetSelector`：依距基座距離排序候選、過濾超出工作範圍或座標異常的候選，終端機互動讓使用者輸入要夾取的 ID |
-| `mask_publisher.py` | `TargetMaskBuilder`：合併「目標果梗」與「最近番茄」的膨脹遮罩，純運算，不做 publish |
-| `visualizer.py` | `Visualizer`：cv2 疊圖（框線/ID/資訊面板）與終端機列印掃描結果，不含任何判斷邏輯 |
-| `cloud_filter_node.py` | 獨立節點 `CloudFilterNode`：跟 `vision_node.py` 分開的 process，訂閱原始點雲 + `/target_filter_mask`，反投影過濾後發布 `/camera/depth/points_gated`；不被 `vision_node.py` import，兩者只透過 ROS topic 溝通 |
+| `fine_skeleton.py` | `PedicelSkeletonizer`：果梗 mask 清理 → 骨架化 → 兩次 BFS 找最長路徑（樹的直徑）排序骨架 → 依比例取抓取點與生長角度。純 2D 像素運算 |
+| `fine_stem_tracker.py` | `StemTracker`：滑動視窗時間平滑，用像素距離配對前後幀同一根果梗，視窗內挑信心分數最高的一筆整包輸出 |
+| `fine_target_selector.py` | `TargetSelector`：依距基座距離排序候選、過濾超出工作範圍或座標異常的候選，終端機互動讓使用者輸入要夾取的 ID |
+| `fine_mask_publisher.py` | `TargetMaskBuilder`：合併「目標果梗」與「最近番茄」的膨脹遮罩，純運算，不做 publish |
+| `fine_visualizer.py` | `Visualizer`：cv2 疊圖（框線/ID/資訊面板）與終端機列印掃描結果，不含任何判斷邏輯 |
+| `cloud_filter_node.py` | 獨立節點 `CloudFilterNode`：跟 `fine_node.py` 分開的 process，訂閱原始點雲 + `/target_filter_mask`，反投影過濾後發布 `/camera/depth/points_gated`；不被 `fine_node.py` import，兩者只透過 ROS topic 溝通 |
 
 ## 03 ROS 2 介面
 
@@ -65,7 +65,11 @@
    │
 ② 掃描：YOLO 偵測 + StemTracker 平滑   (color_callback，每幀執行)
    │
-③ 本輪有候選目標？ ── 否，連續空掃描 ≥ EMPTY_SCAN_GRACE ──┐
+③ 本輪有候選目標？ ── 否，連續判定「看不到能挑的目標」次數 ≥ OCCLUDED_SCAN_GRACE ──┐
+   （完全沒偵測到、候選全部被判定遮擋、候選被其他原因排除，只要這輪沒有能挑的目標
+    都算「看不到」，2026-09-16 起共用同一套即時判斷——偵測到能挑的目標會立刻歸零，
+    不會因為原因分類不同而漏掉某種遮擋方式；先發 /vision_status = OCCLUDED 讓手臂試
+    備用視角，都試完還是看不到才回報 NO_TARGET）
    │ 是                                                    │
 ④ 終端機輸入 ID／s／r  (prompt_choose_id，阻塞)             │
    │  │            └─ r：重新偵測 → 回到 ②                 │
@@ -130,7 +134,7 @@
 | StemTracker | `STEM_MATCH_DIST_PX` | 40.0 px | 前後幀配對同一根果梗的最大像素距離 |
 | | `STEM_TRACK_WINDOW` | 7 | 滑動視窗長度（幀數） |
 | | `STEM_TRACK_MAX_MISS` | 5 | 連續幾幀沒配對到就判定 track 消失 |
-| 掃描/選取 | `EMPTY_SCAN_GRACE` | 2 | 連續幾次空掃描才回報 NO_TARGET |
+| 掃描/選取 | `OCCLUDED_SCAN_GRACE` | 3 | 連續幾輪判定「看不到能挑的目標」（完全沒偵測到、候選全部遮擋、或候選被其他原因排除）才回報 OCCLUDED、換備用視角 |
 | | `SCAN_PRINT_INTERVAL` | 1.5 s | 終端機列印候選清單的節流間隔 |
 | | `MAX_REACH_M` | 1.0 m | 距離基座超過此值的候選直接排除 |
 | 目標遮罩 | `TARGET_MASK_DILATE_PX` | 15 px | 目標番茄 mask 膨脹核心大小 |
@@ -153,7 +157,7 @@
 
 ```bash
 cd /home/terry/tm_ws/python_isaac
-python3 -m vision_node.main
+python3 -m vision_node.fine_main
 ```
 
 `cloud_filter_node.py` 是分開啟動的獨立 process（理由見 08 已知限制），另開一個終端機執行：

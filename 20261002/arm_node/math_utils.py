@@ -77,8 +77,20 @@ class MathUtils:
         grasp = np.array([tomato_x, tomato_y, tomato_z]) - gripper_length * z_axis
         app   = grasp - approach_dist * z_axis
 
-        grasp_target    = (grasp[0], grasp[1], grasp[2], qx, qy, qz, qw, base_yaw)
-        approach_target = (app[0],   app[1],   app[2],   qx, qy, qz, qw, base_yaw)
+        # ★ 2026-09-23：J1 約束目標角改用 atan2(預備點A.y, 預備點A.x)，不再直接用
+        # base_yaw（番茄座標自己的方位角）。跟 orbit_around_target/
+        # camera_facing_flange_pose 的 yaw 算法同一套慣例：對「最終算出來的法蘭
+        # 座標」算方位角，不是對「目標物座標」算方位角。
+        # 原因：備用視角是把接近方向繞目標轉 ALT_VIEW_AZIMUTH_OFFSETS_DEG(±50°)，
+        # 這個轉動量已經大於 J1_TOLERANCE(±40°)——只要「實際需要的 J1 偏移」大致跟著
+        # 這個轉動量走（合理，因為整個接近方向都繞著目標轉了），拿沒轉動前的
+        # base_yaw ±40° 當窗口，幾乎必然把真實 IK 解排除在外，不是某一顆番茄運氣不好，
+        # 是走備用視角時的系統性問題。實測案例：base_yaw 算出的窗口漏掉真實 IK 解的
+        # J1（差約 8.5°，跟「轉動量 50° 超過容忍度 40°」量級吻合），改成量測「預備點A
+        # 自己的方位角」（已經吃進 R_current/z_axis 帶的旋轉）之後，窗口正確涵蓋。
+        yaw_hint = math.atan2(app[1], app[0])
+        grasp_target    = (grasp[0], grasp[1], grasp[2], qx, qy, qz, qw, yaw_hint)
+        approach_target = (app[0],   app[1],   app[2],   qx, qy, qz, qw, yaw_hint)
         return grasp_target, approach_target
 
     """給某個座標+姿態，沿這個姿態的局部 Z 軸往回退 distance 公尺，回傳新的 (x,y,z)，
@@ -118,3 +130,56 @@ class MathUtils:
         nx, ny, nz = MathUtils.retreat_along_local_z(x, y, z, nqx, nqy, nqz, nqw, distance)
         new_yaw = math.atan2(ny, nx)
         return (nx, ny, nz, float(nqx), float(nqy), float(nqz), float(nqw), new_yaw)
+
+    """接近方向 a → 法蘭姿態旋轉矩陣：局部 Z 軸 = a，局部 Y 軸盡量朝世界向上，局部 X = Y × Z。
+    a 垂直朝上/下時無法定義「向上」，丟 ValueError。"""
+    @staticmethod
+    def look_at_rotation(a):
+        z_axis = np.asarray(a, dtype=float)
+        z_axis = z_axis / np.linalg.norm(z_axis)
+        x_axis = np.cross([0.0, 0.0, 1.0], z_axis)
+        n = np.linalg.norm(x_axis)
+        if n < 1e-6:
+            raise ValueError('接近方向垂直朝上/下，無法決定姿態的「向上」方向')
+        x_axis = x_axis / n
+        y_axis = np.cross(z_axis, x_axis)
+        return np.column_stack([x_axis, y_axis, z_axis])
+
+    """粗定位（車載相機）給番茄中心 T=(tx,ty,tz) 與水平接近方向 a=(ax,ay,az)，算出「相機」
+    面對 T、光軸通過 T、離 T distance 公尺時，法蘭(link_6，末端中心)該去的
+    (x,y,z,qx,qy,qz,qw,yaw)。
+    跟 retreat_along_local_z 的差別：那個以「法蘭 Z 軸」為準，但手臂相機不在法蘭軸線上
+    （側向偏移約 13cm，光軸還跟法蘭 Z 差約 5.6°），法蘭 Z 對準番茄的話相機會偏離番茄。
+    這裡以「相機光軸」為準：
+      1. 先用 look_at_rotation(a) 擺好法蘭姿態 r0（Y 向上，跟既有姿態慣例一致，不影響畫面正反）
+      2. 相機光軸在世界座標的方向 = r0 @ cam_z，再用最小旋轉把它轉到剛好等於 a（吃掉傾斜）
+      3. 相機位置 = T − distance × a；法蘭位置 = 相機位置 − r_fl @ cam_t
+    cam_t / cam_z：link_6 座標系下的相機位置 (3,) 與光軸方向 (3,)，呼叫端查 TF
+    (ARM_FLANGE_FRAME → CAMERA_OPTICAL_FRAME) 取得。光軸(Z 軸)不受 isaac 反投影 x/y 手動
+    翻轉影響，所以 real/isaac 兩種模式的 TF 都能直接用。
+    azimuth_offset_deg：把接近方向 a 繞「經過 T 的世界 Z 軸」轉這個角度，用在遮擋備用視角
+    （效果跟 orbit_around_target 一樣：距離跟面對目標保證不變，只換方位角）。
+    yaw 沿用 orbit_around_target 的算法：atan2(法蘭位置.y, 法蘭位置.x)，只是 J1 軟提示。"""
+    @staticmethod
+    def camera_facing_flange_pose(tx, ty, tz, ax, ay, az, distance, cam_t, cam_z,
+                                   azimuth_offset_deg=0.0):
+        a = np.array([ax, ay, az], dtype=float)
+        a = R.from_euler('z', math.radians(azimuth_offset_deg)).apply(a / np.linalg.norm(a))
+        r0 = MathUtils.look_at_rotation(a)
+
+        cam_z = np.asarray(cam_z, dtype=float)
+        zc = r0 @ (cam_z / np.linalg.norm(cam_z))
+        axis = np.cross(zc, a)
+        s, c = np.linalg.norm(axis), float(np.dot(zc, a))
+        if s > 1e-9:
+            r_align = R.from_rotvec(axis / s * math.atan2(s, c)).as_matrix()
+            r_fl = r_align @ r0
+        else:
+            r_fl = r0
+
+        p_cam = np.array([tx, ty, tz]) - distance * a
+        p_fl = p_cam - r_fl @ np.asarray(cam_t, dtype=float)
+        qx, qy, qz, qw = R.from_matrix(r_fl).as_quat()
+        yaw = math.atan2(p_fl[1], p_fl[0])
+        return (float(p_fl[0]), float(p_fl[1]), float(p_fl[2]),
+                float(qx), float(qy), float(qz), float(qw), yaw)
